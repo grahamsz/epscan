@@ -1,199 +1,147 @@
-# nkscan for Python
+# Python interface
 
-We include python bindings to the library component via PyO3.
-Most useful library features are exported to design python-based applications and GUIs.
-Data is passed from rust to python with zero-copy numpy pointers, so we should keep some semblance of speed (although you get what you pay for with python).
+Build from this checkout with Python 3.13+ and Rust:
 
-The bindings need Python 3.13+.
-
-## Building from scratch
-
-```bash
-pip install maturin
-maturin develop --features python   # editable install into the active venv
-# or: maturin build --release --features python --out dist
+```sh
+python -m pip install maturin
+maturin develop --release
 ```
 
-You can also just install from PyPI with
-
-```bash
-pip install nkscan
-```
-
-## Quick start
+The extension is `epscan`. No NumPy or proprietary scanner API is required.
+Acquisition streams to disk; results are dictionaries containing file paths,
+image dimensions/depth, and metadata. This is the Epson API, not compatibility
+with the cloned Nikon binding.
 
 ```python
-import nkscan
+import epscan
 
-device = nkscan.list_devices()[0]
-session = nkscan.Session.open(device)
-# or, if you already know where it is: nkscan.Session("/dev/sg4")
-
-if not session.media_loaded():
-    session.load()
-
-discovery = session.discover_frames()  # or format="66" where the holder can't tell on its own
-print(discovery.frames)  # [(top, left, bottom, right), ...]
-
-result = session.scan_frame(discovery.frames[0], clean=True)
-red = result.colors["red"]        # numpy uint16, shape (rows, cols)
-print(result.dpi, red.shape, red.dtype)
-
-session.close()  # or use Session as a context manager
+print(epscan.list_devices())
+with epscan.Session() as scanner:
+    print(scanner.capabilities())
+    result = scanner.scan(
+        "captures/film",
+        settings={"source": "transparency", "dpi": 300, "depth": 16,
+                  "rect_mm": [10, 30, 40, 80], "gamma": "device-default"},
+        options={"film": "negative", "export_tiff": True},
+        progress=lambda phase, index, done, total: True,
+    )
+    print(result["rgb"]["tiff"])
 ```
 
-## What the scanner can do
+`Session(device=None, backend_name="auto", timeout=60.0)` selects the sole
+supported scanner, or the exact device location reported by `list_devices`.
+Available backends are `auto`, `nusb`, and Windows `usbscan`. `timeout` is the
+I/O timeout in seconds, greater than zero and at most 214. `capabilities()` returns identity fields;
+`diagnostics()` also queries device status and model/source profiles.
 
-`session.capabilities` reports what the attached unit offers, so a GUI can hide controls it does not have rather than failing once a scan is under way.
+All `settings` entries are optional; omitted values use `ScanSettings` defaults:
+
+| Key | Values / default |
+| --- | --- |
+| `source` | `transparency` (default), `transparency-8x10`, `flatbed` |
+| `mode` | `rgb` (default) or `gray` for single-channel grayscale acquisition |
+| `dpi` | Integer, default 300; checked against connected device/model |
+| `depth` | 8 or 16 bits/channel, default 16 |
+| `rect_mm` | x, y, width, height; default `[0, 0, 10, 10]` |
+| `gamma` | `device-default` (default, no LUT upload), `identity-lut` (opt-in) |
+| `preview` | Boolean, default false; choose a lower DPI and depth 8 for a preview |
+
+Optional `options` entries:
+
+| Key | Default / meaning |
+| --- | --- |
+| `infrared` | false; add experimental IR8 after RGB |
+| `infrared_only` | false; acquire only IR8 |
+| `ir_depth` | 8; other depths are rejected by the current model |
+| `ir_gamma` | `device-default` |
+| `thumbnail` | false; add model-preset RGB preview before final RGB |
+| `export_tiff` | true; false keeps raw payload and metadata only |
+| `film` | `negative`; media label, no inversion/profile processing |
+| `pass_timeout` | 600 seconds; image transfer deadline |
+| `settle_seconds` | 10 seconds; delay between passes |
+
+Unknown keys and invalid values are rejected. Source eligibility, geometry,
+depth and every requested pass are validated before scan configuration. IR-only
+uses `ir_depth` and `ir_gamma`; the RGB settings are unused for that pass. Media
+labels do not establish the film's physical compatibility with infrared.
+
+For B&W negatives, use `settings={"mode": "gray"}` and
+`options={"film": "mono"}` alongside your scan geometry. Grayscale captures
+are returned in `result["gray"]`, with one channel at the requested depth;
+color captures use `result["rgb"]`. The film label alone does not change the
+acquisition mode. Region batching supports both modes.
+
+## Region batches
+
+`scan_regions(basename, regions_mm, *, settings=None, options=None,
+max_gap_mm=10.0, progress=None, region_done=None)` accepts a list of physical
+`[x, y, width, height]` rectangles in millimetres. Each region overrides
+`settings["rect_mm"]`; the other settings and options apply to every region.
+The complete list and every resulting acquisition are validated before scanner
+configuration or output files are created.
+
+Nearby regions in the same vertical strip are scanned using their combined
+bounding box, then extracted into separate images. An ordinary Epson
+V800/V850 35 mm Film Strip Holder with 18 selected frames therefore takes three
+visible acquisitions, one for each strip. The rectangles supplied by the caller
+determine both the bounds and the extracted crops, including any edits to frame
+size, position or spacing. A vertical gap greater than `max_gap_mm` splits a
+strip into separate acquisitions. Regions in separate strip columns remain
+separate; sparse selections can require more scans. Infrared and thumbnail jobs
+use separate per-region acquisitions to preserve their existing pass behavior.
+
+`plan_regions(regions_mm, *, settings=None, options=None, max_gap_mm=10.0)`
+validates and returns this plan using the session's cached capabilities, with
+no scanner I/O and no output files. Its `batches` list contains each batch's
+zero-based `region_indices`, bounding box in `settings["rect_mm"]`, and
+`plan["passes"]`. The sum of these pass-list lengths is the number of hardware
+acquisitions. `region_plans` describes the individual requested outputs.
 
 ```python
-caps = session.capabilities
-print(caps.vendor, caps.product, caps.optical_dpi)
-
-if not caps.multi_line:
-    hide("superfine")        # this unit never reads three lines at once
-if not caps.thumbnail:
-    hide("keep thumbnail")   # it frames from a page, with no thumbnail pass
-if not caps.eject:
-    hide("eject")            # the operator takes the holder out by hand
-if not caps.autofocus:
-    hide("autofocus")
+with epscan.Session() as scanner:
+    regions = [
+        [2.3, 16.5, 24.0, 36.0],
+        [2.3, 54.5, 24.0, 36.0],
+        [62.1, 16.5, 24.0, 36.0],
+    ]
+    settings = {"source": "transparency", "dpi": 2400, "depth": 16}
+    plan = scanner.plan_regions(regions, settings=settings)
+    print([batch["settings"]["rect_mm"] for batch in plan["batches"]])
+    # The first two frames share one strip acquisition; the third is separate.
+    results = scanner.scan_regions(
+        "captures/roll", regions, settings=settings,
+        region_done=lambda index, result: print(index, result["rgb"]["tiff"]) is None,
+    )
 ```
 
-`x_dpi_range`, `y_dpi_range`, `focus_range`, `max_samples` and `max_frames` bound the controls that take a number. `framing` says how frames are found ("published", "thumbnail", "perforation" or "address"), and `interleavings` lists the reading modes offered.
+Results are standard scan-result dictionaries in the original region-list
+order. `region_done(index, result)` runs after each completed output, using the
+zero-based input index. Completion callbacks follow acquisition order, which
+may differ from input order. Both `region_done` and `progress` must return
+`True` to continue; returning `False` cancels. Callback exceptions are preserved
+and re-raised. Region-batch progress receives `(phase, batch_index, done, total)`,
+where `batch_index` is zero-based and `done`/`total` track acquired bytes across
+all batches. Extraction and saving hold the acquired fraction; 100% is reported
+only after all output callbacks succeed. The `regions` phase marks batch completion. Hardware I/O and
+image extraction release the Python interpreter. Completed output files remain available if a later
+region fails or the operation is cancelled.
 
-## White balance
+The `scan` progress callback receives `(phase, pass_index, done, total)` and must return
+`True` to continue or `False` to cancel. Byte counts apply to transfer phases;
+setup/settling phases use progress sentinels. Exceptions from the callback are
+re-raised after the Rust layer closes the failed session and preserves files.
+The interpreter is released during I/O. Another thread can call
+`request_cancel()`; other simultaneous operations on that session raise
+`DeviceBusy`. Cancellation applies to an active scan; a new scan clears a prior
+cancellation request. Python signals are checked in progress callbacks, so a
+warmup wait can delay Ctrl+C until the next progress update. Another thread's
+`request_cancel()` is also checked during warmup.
 
-`scan_frame(lock_white_balance=...)` decides whether the channels are metered together or one at a time. The right default follows the film, not the scanner:
+`close()` is idempotent; context-manager exit closes the connection. Capture
+errors close it too. Completed passes remain on disk; inspect the JSON manifest
+when a later pass fails. Reopening may not recover a desynchronized device.
 
-```python
-lock = nkscan.Capabilities.locks_white_balance("negative")  # False
-session.scan_frame(frame, lock_white_balance=lock)
-```
-
-Color negative meters each channel separately, which takes the orange mask off before the ADC and is what Nikon Scan does. Slide, Kodachrome and black and white keep the factory balance.
-
-`scan_frame` defaults to `True` whatever the film, so pass this explicitly when scanning negatives. `caps.hardware_metering` is `False` on every unit seen, an LS-9000 included - metering happens here rather than in the scanner, which is what makes the setting matter at all.
-
-Every `scan_frame` meters its own frame unless it is handed `exposures`. To expose a batch the same way, meter one frame and pass its exposures to the rest. `meter_frame` meters without scanning; ask for `infrared` there if the scans take the infrared plane or clean:
-
-```python
-exposures = session.meter_frame(frames[1], infrared=True, lock_white_balance=lock)
-for frame in frames:
-    session.scan_frame(frame, infrared=True, exposures=exposures)
-```
-
-## Focus
-
-By default, `scan_frame` autofocuses on the center of the frame. Use `focus` to change this:
-
-- `"auto"`: the unit focuses on the center of the frame. This is the default.
-- `(x, y)`: the unit focuses on this point. Each value is a fraction of the frame size.
-- An int: the lens moves to this position. The position must be in `caps.focus_range`.
-- `"hold"`: the lens does not move.
-
-`focus_frame` focuses without a scan. To focus one time for a batch, focus on one frame and scan all frames with `"hold"`:
-
-```python
-focused, position = session.focus_frame(frames[1])  # ("focused", 210)
-for frame in frames:
-    result = session.scan_frame(frame, focus="hold")
-```
-
-`ScanResult.focused` gives the focus result:
-
-- `"focused"`: the unit reached focus, or the lens moved to the position.
-- `"not_reached"`: autofocus did not reach focus. The scan continued at the last lens position.
-- `"skipped"`: `focus` was `"hold"`.
-
-`ScanResult.focus_position` gives the lens position during the scan. To control the lens directly, use `autofocus(x, y)`, `focus_to(position)` and `focus_position()`.
-
-## Check the result
-
-`ScanResult.complete` is `True` if all blocks of the pass arrived. `ScanResult.blocks` gives the number of blocks that arrived. If a pass is short, the planes contain data only for those blocks.
-
-`Discovery.thumbnail_complete` and `Discovery.thumbnail_blocks` give the same data for the thumbnail pass. `Discovery.contrast` gives the quality of the frame fit on the thumbnail. Compare it only between strips on the same unit.
-
-## Color profiles
-
-`session.nikon_profile(film)` returns the bytes of Nikon's ICC profile for this unit and film. It returns `None` if Nikon Scan has no profile for them:
-
-```python
-icc = session.nikon_profile("negative")
-```
-
-## Nudging frames by hand
-
-`scan_frame` scans the rectangle it is given. The pass is that rectangle at both
-ends, so there is nothing to crop afterwards. A rectangle moved along the feed, or
-cropped, is put in the unit's frame table before the pass, so it reaches the film
-it asks for.
-
-`discover_frames` returns the thumbnail it detected against, keyed the same way
-`ScanResult.colors` is, along with the mapping between a thumbnail column and a
-feed address:
-
-```python
-discovery = session.discover_frames()  # or format="66" where the holder can't tell on its own
-if discovery.thumbnail is not None:
-    show_to_operator(discovery.thumbnail)  # dict[str, NDArray[uint16]]
-```
-
-Use `discovery.addresses_per_column` to go between the two, so the rectangle the
-operator sees is the rectangle that gets scanned:
-
-```python
-per = discovery.addresses_per_column          # e.g. 41.87 on an LS-50
-top, left, bottom, right = discovery.frames[3]
-
-# the frame's own columns of the thumbnail, to draw or slice a preview tile
-first, last = round(top / per), round(bottom / per)
-tile = {name: plane[:, first:last] for name, plane in discovery.thumbnail.items()}
-
-# and back, for a rectangle the operator dragged
-moved = (round(first * per), left, round(last * per), right)
-result = session.scan_frame(moved)
-```
-
-Do **not** compute that number as `optical_dpi / thumbnail_dpi`. The film does not
-keep to the thumbnail resolution the unit reports, and the error accumulates along
-the strip: on an LS-50 that is 4 mm by the sixth frame. It is measured from each
-thumbnail pass, so read it from each `Discovery` and do not cache it.
-
-## Progress and cancellation
-
-Both `discover_frames` and `scan_frame` take a `progress` callback.
-Returning `False` cancels the pass in progress; anything else (including `None`) continues.
-
-```python
-def on_progress(phase, pass_number, bytes_done, bytes_total):
-    print(phase, pass_number, bytes_done, "/", bytes_total)
-    return bytes_done < bytes_total // 2  # bail out partway through, for real
-
-session.scan_frame(frame, progress=on_progress)
-```
-
-## Errors
-
-Everything raises a subclass of `nkscan.ScannerError`. `TransientError` (and its children `TransportError`, `DeviceBusy`) is what's worth retrying.
-`UnsupportedError` carries `.op` and `.reason` attributes.
-
-```python
-try:
-    session.scan_frame(frame)
-except nkscan.ScanCancelled:
-    pass
-except nkscan.TransientError:
-    retry()
-```
-
-## The stub
-
-`nkscan.pyi` is auto generated, not hand-written `src/python.rs`.
-Regenerate it after changing the bindings:
-
-```bash
-cargo run --features python --bin stub_gen
-```
-
-CI fails if it's stale.
+Exceptions: `ScannerError`, `DeviceNotFound`, `DeviceBusy`, `UnsupportedError`,
+and `ScanCancelled`; invalid arguments raise `ValueError`. See [README](README.md)
+for hardware status and output semantics. The hand-maintained `epscan.pyi` describes
+this API; Rust tests exercise dictionary parsing and simulated Python acquisition.

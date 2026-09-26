@@ -1,62 +1,33 @@
-//! High level errors containing protocol and transport errors
-
-use crate::protocol::sense::{Contention, Failure, Fault, Intervention, Outcome};
-use crate::transport::{self, Completion};
-
-/// Top crate-level scanner errors
+// SPDX-License-Identifier: MIT OR Apache-2.0
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error(transparent)]
-    Transport(#[from] transport::Error),
-
-    #[error("{0}")]
-    Busy(Contention),
-
-    #[error("{0}")]
-    Media(Intervention),
-
-    #[error("no such scanner")]
-    NotFound,
-
-    #[error("{op} is not supported{}", match reason.is_empty() {
-        true => String::new(),
-        false => format!(": {reason}"),
-    })]
-    Unsupported { op: &'static str, reason: String },
-
+    #[error("device not found: {0}")]
+    NotFound(String),
+    #[error("scanner busy: {0}")]
+    Busy(String),
+    #[error("driver/access configuration: {0}")]
+    Driver(String),
+    #[error("unsupported {feature}: {reason}")]
+    Unsupported { feature: String, reason: String },
+    #[error("ESC/I protocol: {0}")]
+    Protocol(String),
     #[error("scan cancelled")]
     Cancelled,
-
-    #[error("{0}")]
-    Device(Box<Fault>),
+    #[error("timeout: {0}")]
+    Timeout(String),
+    #[error("invalid settings: {0}")]
+    Invalid(String),
+    #[error("I/O: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("JSON: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("TIFF: {0}")]
+    Tiff(#[from] tiff::TiffError),
 }
-
-/// A page that would not parse is our model of the device being wrong, which
-/// is the same class of problem as the device reporting a fault
-impl From<crate::protocol::caps::Error> for Error {
-    fn from(e: crate::protocol::caps::Error) -> Self {
-        Self::Device(Box::new(Fault::Caps(e)))
-    }
-}
-
-impl Error {
-    /// Turn a terminal [`Outcome`] into an error
-    ///
-    /// The completion comes along because the sense bytes belong to it, not to
-    /// the outcome, and they are what makes a fault reportable.
-    ///
-    /// `Working`, `NeedsHost` and `StateChanged` are the retry loop's business
-    /// and should never reach here. They are not unreachable, though, since a
-    /// caller that skips the loop will produce one, so they fall through to a
-    /// fault rather than a panic.
-    pub fn from_outcome(outcome: Outcome, completion: &Completion) -> Self {
-        let sense = || completion.sense.clone();
-        match outcome {
-            Outcome::NeedsOperator(i) => Self::Media(i),
-            Outcome::Contended(c) => Self::Busy(c),
-            Outcome::Refused(r) => Self::Device(Box::new(Fault::Rejected(r, sense()))),
-            Outcome::Failed(f) => Self::Device(Box::new(Fault::Reported(f, sense()))),
-            _ => Self::Device(Box::new(Fault::Reported(Failure::Unrecognized, sense()))),
-        }
+pub type Result<T> = std::result::Result<T, Error>;
+pub fn unsupported(feature: impl Into<String>, reason: impl Into<String>) -> Error {
+    Error::Unsupported {
+        feature: feature.into(),
+        reason: reason.into(),
     }
 }

@@ -1,241 +1,39 @@
 name: CI
-
 on:
-    push:
-        branches: [main]
-        paths-ignore: &docs-paths
-            - "**.md"
-            - "LICENSE-*"
-    pull_request:
-        branches: [main]
-        paths-ignore: *docs-paths
-    workflow_dispatch:
-
-# Cancel superseded runs for the same branch/PR
-concurrency:
-    group: ci-${{ github.ref }}
-    cancel-in-progress: true
-
+  push:
+  pull_request:
+  workflow_dispatch:
 permissions:
-    contents: read
-
-env:
-    CARGO_TERM_COLOR: always
-
-# The flake is still the dev shell and still builds, but nothing here goes through it: a Nix
-# job on a GitHub runner spends most of its time installing Nix and populating a cache, and it
-# only ever covers the one platform it runs on. rustup reads rust-toolchain.toml, so these
-# jobs use the same channel, components and targets the devshell does, with no version pinned
-# in this file to drift from it.
+  contents: read
 jobs:
-    fmt:
-        name: Formatting
-        runs-on: ubuntu-latest
-        steps:
-            - name: Checkout repository
-              uses: actions/checkout@v4
-
-            - name: Install the toolchain rust-toolchain.toml names
-              run: cargo --version
-
-            - name: Rust
-              run: cargo fmt --all --check
-
-            - name: Install taplo
-              uses: taiki-e/install-action@v2
-              with:
-                  tool: taplo-cli
-
-            # Tracked files only. Left to itself taplo walks everything, which on a working
-            # copy means the flake inputs under .direnv and a few hundred TOMLs that are not
-            # ours to format
-            - name: TOML
-              run: git ls-files '*.toml' | xargs taplo fmt --check
-
-    clippy:
-        name: Clippy
-        runs-on: ubuntu-latest
-        steps:
-            - name: Checkout repository
-              uses: actions/checkout@v4
-
-            - name: Install the toolchain rust-toolchain.toml names
-              run: cargo --version
-
-            # pyo3 needs an interpreter to build against, and --all-features is what will lint
-            # the bindings when they come back. numpy is not needed: nothing here calls into it
-            - name: Install Python
-              uses: actions/setup-python@v5
-              with:
-                  python-version: "3.13"
-
-            # `shared-key` rather than the default per-job key, so the test job below restores
-            # what this one compiled instead of building the dependency graph a second time.
-            # This job is the one that saves it: it builds every feature, so its target dir is
-            # a superset of what the other needs
-            - name: Cache Rust artifacts
-              uses: Swatinem/rust-cache@v2
-              with:
-                  shared-key: host
-
-            - name: Clippy
-              run: cargo clippy --all-targets --all-features -- --deny warnings
-
-    test:
-        name: Tests
-        runs-on: ubuntu-latest
-        steps:
-            - name: Checkout repository
-              uses: actions/checkout@v4
-
-            - name: Install the toolchain rust-toolchain.toml names
-              run: cargo --version
-
-            # Restore only: the clippy job shares this key and is the one that writes it, so
-            # the two do not race to save the same entry
-            - name: Cache Rust artifacts
-              uses: Swatinem/rust-cache@v2
-              with:
-                  shared-key: host
-                  save-if: false
-
-            # Deliberately not --all-features. An extension module leaves its Python symbols
-            # for the host interpreter to resolve, which is right for the cdylib a wheel ships
-            # and impossible for a test binary, which has no interpreter to link against.
-            # Nothing is lost: the bindings have no Rust tests, and clippy checks every
-            # feature above because checking never links
-            - name: Test
-              run: cargo test --features cli
-
-    # Only the host target gets built above, and on this runner that is x86_64 Linux.
-    # Everything else was compiled by nothing: `src/transport/windows.rs` first met a compiler
-    # when a release tag reached the Windows job and failed there, and the macOS side had
-    # accumulated dead code behind the same gap.
-    #
-    # A cross-check rather than a runner per platform: `cargo clippy` does not link, so each
-    # of these needs the target's std and no platform toolchain at all, and it catches the
-    # class of thing that was actually wrong. The real builds are in release.yml, which is
-    # where a linker error would show up.
-    cross:
-        name: Cross-check ${{ matrix.target }}
-        runs-on: ubuntu-latest
-        strategy:
-            fail-fast: false
-            matrix:
-                # The host target is left out: the clippy job above covers it. musl is in
-                # because release.yml ships it, and a target we ship is one to lint
-                target:
-                    - x86_64-pc-windows-msvc
-                    - aarch64-apple-darwin
-                    - x86_64-apple-darwin
-                    - x86_64-unknown-linux-musl
-                    - aarch64-unknown-linux-gnu
-        steps:
-            - name: Checkout repository
-              uses: actions/checkout@v4
-
-            # A target missing from rust-toolchain.toml is what fails this step
-            - name: Install the toolchain rust-toolchain.toml names
-              run: cargo --version
-
-            - name: Cache Rust artifacts
-              uses: Swatinem/rust-cache@v2
-              with:
-                  key: ${{ matrix.target }}
-
-            # Not --all-features: the `python` feature would cross-compile pyo3, which wants
-            # an interpreter for the host it is building for
-            - name: Clippy
-              run: cargo clippy --target ${{ matrix.target }} --all-targets --features cli -- --deny warnings
-
-    # The stub is what a consumer sees of an abi3 extension, since one carries no introspectable
-    # signatures. It is generated, so this only has to catch a commit that forgot to regenerate.
-    stubs:
-        name: Stub is up to date
-        runs-on: ubuntu-latest
-        steps:
-            - name: Checkout repository
-              uses: actions/checkout@v4
-
-            - name: Install the toolchain rust-toolchain.toml names
-              run: cargo --version
-
-            - name: Cache Rust artifacts
-              uses: Swatinem/rust-cache@v2
-
-            # pyo3 needs an interpreter to build against. numpy is not needed: the generator
-            # reads type information rather than calling into it.
-            - name: Install Python
-              uses: actions/setup-python@v5
-              with:
-                  python-version: "3.13"
-
-            - name: Regenerate
-              run: cargo run --features python --bin stub_gen
-
-            - name: Fail if it differs from what is committed
-              run: |
-                  if ! git diff --exit-code nkscan.pyi; then
-                    echo "::error::nkscan.pyi is stale, run: cargo run --features python --bin stub_gen"
-                    exit 1
-                  fi
-
-    # The flake checks that the bindings compile, but only a manylinux build proves the wheel a
-    # consumer would actually install. Nix cannot produce one: it links against nix-store glibc
-    # with nix-store rpaths, and the result is tagged linux_x86_64, which no index accepts.
-    #
-    # Run on every change rather than at tag time, when a release is already half published.
-    wheel:
-        name: Build wheel
-        runs-on: ubuntu-latest
-        steps:
-            - name: Checkout repository
-              uses: actions/checkout@v4
-
-            - name: Build wheel
-              uses: PyO3/maturin-action@v1
-              with:
-                  args: --release --out dist
-                  manylinux: auto
-
-            # The runner's default python is older than the abi3 floor, so pip would refuse a
-            # cp313 wheel. Both versions are installed to prove the point of abi3: one wheel
-            # covers the floor and every interpreter after it.
-            - name: Install the interpreters the wheel claims to support
-              uses: actions/setup-python@v5
-              with:
-                  python-version: |
-                      3.13
-                      3.14
-
-            - name: Check it is tagged for redistribution
-              run: |
-                  ls -l dist/
-                  # abi3 names one interpreter floor and works on every later one, so a wheel
-                  # tagged for a single version means the abi3 feature stopped taking effect
-                  for wheel in dist/*.whl; do
-                    case "$wheel" in
-                      *abi3-manylinux*) echo "ok: $wheel" ;;
-                      *) echo "::error::$wheel will not install off this machine" && exit 1 ;;
-                    esac
-                  done
-
-            - name: Check it installs and imports on every one of them
-              run: |
-                  for python in python3.13 python3.14; do
-                    echo "--- $python"
-                    "$python" -m pip install --upgrade pip
-                    "$python" -m pip install dist/*.whl
-                    "$python" - <<'PY'
-                  import nkscan, sys
-                  print("  running on", sys.version.split()[0])
-                  # No scanner is attached to a runner, so this exercises enumeration finding none
-                  assert nkscan.list_devices() == []
-                  assert issubclass(nkscan.TransportError, nkscan.TransientError)
-                  try:
-                      nkscan.Session("nonsense")
-                  except nkscan.DeviceNotFound:
-                      pass
-                  print("  import, enumeration and error hierarchy all fine")
-                  PY
-                  done
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo test --locked --all-targets --features cli
+      - run: cargo test --locked --lib
+      - run: cargo test --locked --doc
+      - run: cargo test --locked --lib --all-features
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+  wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          args: --release --locked --out dist
+          manylinux: auto
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install dist/*.whl
+      - run: python tests/python_smoke.py

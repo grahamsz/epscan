@@ -1,25 +1,33 @@
-//! A cross-platform driver for Nikon (Coolscan) film scanners
+//! Direct Epson ESC/I acquisition with interchangeable USB transports.
 //!
 //! ```no_run
-//! use nkscan::{device, session::Session};
+//! use epscan::{Backend, ScanOptions, ScanSettings, Session};
+//! use std::{path::Path, sync::atomic::AtomicBool, time::Duration};
 //!
-//! let devices = device::list();
-//! let device = devices.first().expect("no scanner found");
-//! let mut session = Session::open(device.open()?)?;
-//!
-//! session.stage()?; // homes the mechanism once a holder is loaded
-//! let caps = session.capabilities();
-//! # Ok::<(), nkscan::error::Error>(())
+//! let mut scanner = Session::connect(None, Backend::Auto, Duration::from_secs(60))?;
+//! let result = scanner.scan(
+//!     &ScanSettings::default(), &ScanOptions::default(), Path::new("captures/film"),
+//!     &AtomicBool::new(false), &mut |_| true,
+//! )?;
+//! println!("{}", result.manifest.display());
+//! # Ok::<(), epscan::Error>(())
 //! ```
-
+pub mod capabilities;
 pub mod device;
-pub mod dust;
 pub mod error;
+pub mod protocol;
 #[cfg(feature = "python")]
 pub mod python;
-#[cfg(feature = "python")]
-pub use python::stub_info as python_stub_info;
-pub mod protocol;
 pub mod scan;
 pub mod session;
 pub mod transport;
+
+pub use capabilities::{Holder, HolderLayout, ScanMode};
+pub use device::{Backend, Device, list_devices};
+pub use error::{Error, Result};
+pub use protocol::{Capabilities, Gamma, ScanSettings, Source};
+pub use scan::{PassKind, PlannedPass, Progress, ScanOptions, ScanPlan, ScanResult};
+pub use session::{Session, image::ImageResult};
+
+#[cfg(test)]
+mod tests;

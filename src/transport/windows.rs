@@ -1,231 +1,321 @@
-//! SCSI transport on Windows, via the scanner class driver scsiscan.sys, which will be any scanner that talks via scsi
-
-use super::{Completion, Data, Error, Status, Transport, sense_from_fixed};
-use std::{io, os::windows::ffi::OsStrExt, path::Path, ptr, thread::sleep, time::Duration};
-use tracing::*;
-use windows_sys::Win32::{
-    Foundation::{CloseHandle, ERROR_WORKING_SET_QUOTA, HANDLE, INVALID_HANDLE_VALUE},
-    Storage::FileSystem::{
-        CreateFileW, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        OPEN_EXISTING,
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//! Bulk access through the installed usbscan.sys driver, without WIA/STI/TWAIN.
+use super::{Backend, Device, Transport};
+use crate::{Error, Result, capabilities::scanner_model};
+use std::{
+    mem::{size_of, zeroed},
+    ptr::{null, null_mut},
+    time::Duration,
+};
+use windows_sys::{
+    Win32::{
+        Devices::DeviceAndDriverInstallation::*,
+        Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE},
+        Storage::FileSystem::{CreateFileW, OPEN_EXISTING, ReadFile, WriteFile},
+        System::IO::DeviceIoControl,
     },
-    System::IO::DeviceIoControl,
+    core::GUID,
 };
 
-/// `FILE_DEVICE_SCANNER << 16 | function 4 << 2 | METHOD_OUT_DIRECT`
-const IOCTL_SCSISCAN_CMD: u32 = 0x0019_0012;
-
-/// `SCSISCAN_CMD::srb_flags` direction values
-const SRB_FLAGS_NO_DATA: u32 = 0x00;
-const SRB_FLAGS_DATA_IN: u32 = 0x40;
-const SRB_FLAGS_DATA_OUT: u32 = 0x80;
-
-/// The status byte the driver writes back through `srb_status`
-const SRB_STATUS_SUCCESS: u8 = 0x01;
-const SRB_STATUS_ERROR: u8 = 0x04;
-const SRB_STATUS_BUSY: u8 = 0x05;
-/// Set alongside a base status when the driver has filled the sense buffer
-const SRB_STATUS_AUTOSENSE_VALID: u8 = 0x80;
-/// The base status lives in the low six bits; the top two are flags
-const SRB_STATUS_MASK: u8 = 0x3F;
-
-/// How much sense to ask for
-const SENSE_LENGTH: usize = 32;
-const QUOTA_RETRIES: usize = 200;
-const QUOTA_RETRY_DELAY: Duration = Duration::from_millis(50);
-const MAX_TRANSFER: usize = 128 * 1024;
-
-/// Microsoft's `SCSISCAN_CMD`, from `scsiscan.h`
-#[repr(C)]
-struct ScsiScanCmd {
-    reserved1: u32,
-    size: u32,
-    srb_flags: u32,
-    cdb_length: u8,
-    sense_length: u8,
-    reserved2: u8,
-    reserved3: u8,
-    transfer_length: u32,
-    cdb: [u8; 16],
-    srb_status: *mut u8,
-    sense_buffer: *mut u8,
+fn win_error(operation: &str) -> Error {
+    let error = std::io::Error::last_os_error();
+    let text = format!("{operation}: {error}");
+    match error.raw_os_error() {
+        Some(2 | 3 | 1167) => Error::NotFound(text),
+        Some(32 | 33) => Error::Busy(text),
+        Some(5) => Error::Driver(text),
+        Some(121 | 1460) => Error::Timeout(text),
+        _ => Error::Io(error),
+    }
 }
 
-/// A scanner reachable through `scsiscan.sys`
-pub struct ScsiScanDevice {
+struct DeviceSet(HDEVINFO);
+impl Drop for DeviceSet {
+    fn drop(&mut self) {
+        unsafe {
+            SetupDiDestroyDeviceInfoList(self.0);
+        }
+    }
+}
+
+pub fn discover() -> Result<Vec<Device>> {
+    let guid = GUID::from_u128(0x6bdd1fc6_810f_11d0_bec7_08002be2092f);
+    // SAFETY: typed Win32 structures, sized output buffers, and handles owned here.
+    unsafe {
+        let raw = SetupDiGetClassDevsW(
+            &guid,
+            null(),
+            null_mut(),
+            DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
+        );
+        if raw == -1 {
+            return Err(win_error("enumerating imaging interfaces"));
+        }
+        let set = DeviceSet(raw);
+        let mut devices = Vec::new();
+        for index in 0.. {
+            let mut interface: SP_DEVICE_INTERFACE_DATA = zeroed();
+            interface.cbSize = size_of::<SP_DEVICE_INTERFACE_DATA>() as u32;
+            if SetupDiEnumDeviceInterfaces(set.0, null(), &guid, index, &mut interface) == 0 {
+                if GetLastError() == 259 {
+                    break;
+                }
+                return Err(win_error("enumerating interface"));
+            }
+            let mut needed = 0;
+            SetupDiGetDeviceInterfaceDetailW(
+                set.0,
+                &interface,
+                null_mut(),
+                0,
+                &mut needed,
+                null_mut(),
+            );
+            if needed < 6 {
+                return Err(win_error("sizing device path"));
+            }
+            // u64 allocation provides alignment for SP_DEVICE_INTERFACE_DETAIL_DATA_W.
+            let mut storage = vec![0u64; (needed as usize).div_ceil(8)];
+            let detail = storage
+                .as_mut_ptr()
+                .cast::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>();
+            (*detail).cbSize = size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32;
+            if SetupDiGetDeviceInterfaceDetailW(
+                set.0,
+                &interface,
+                detail,
+                needed,
+                null_mut(),
+                null_mut(),
+            ) == 0
+            {
+                return Err(win_error("reading imaging path"));
+            }
+            let chars = std::slice::from_raw_parts(
+                (*detail).DevicePath.as_ptr(),
+                (needed as usize - 4) / 2,
+            );
+            let len = chars
+                .iter()
+                .position(|v| *v == 0)
+                .ok_or_else(|| Error::Driver("Unterminated device path".into()))?;
+            let path = String::from_utf16_lossy(&chars[..len]);
+            if let Some((vid, pid)) = usb_ids_from_path(&path) {
+                let Some(model) = scanner_model(vid, pid) else {
+                    continue;
+                };
+                devices.push(Device {
+                    location: path,
+                    name: model.name.into(),
+                    vid,
+                    pid,
+                    backend: Backend::Usbscan,
+                });
+            }
+        }
+        Ok(devices)
+    }
+}
+
+fn usb_ids_from_path(path: &str) -> Option<(u16, u16)> {
+    let path = path.to_ascii_lowercase();
+    let read_id = |marker: &str| {
+        let start = path.find(marker)? + marker.len();
+        let digits = path.get(start..start + 4)?;
+        if path
+            .as_bytes()
+            .get(start + 4)
+            .is_some_and(u8::is_ascii_hexdigit)
+        {
+            return None;
+        }
+        u16::from_str_radix(digits, 16).ok()
+    };
+    Some((read_id("vid_")?, read_id("pid_")?))
+}
+
+pub struct UsbscanTransport {
     handle: HANDLE,
+    timeout: u32,
 }
-
-// The handle is owned by this struct and every use goes through `&mut self`
-unsafe impl Send for ScsiScanDevice {}
-
-impl ScsiScanDevice {
-    /// Open a scanner by device path, conventionally `\\.\Scanner0`
-    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
-        let path = path.as_ref();
-        let wide: Vec<u16> = path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-
-        // SAFETY: `wide` is NUL terminated and outlives the call, and the two null pointers
-        // are documented as optional for security attributes and template file.
+// SAFETY: this type uniquely owns the file handle and only issues synchronous
+// operations through `&mut self`. Windows file handles are not thread-affine.
+// Moving ownership between threads cannot overlap I/O or close with another
+// operation; sharing concurrent access is deliberately not provided (`Sync`).
+unsafe impl Send for UsbscanTransport {}
+impl Drop for UsbscanTransport {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
+}
+impl UsbscanTransport {
+    pub fn open(path: &str) -> Result<Self> {
+        if path.contains('\0') {
+            return Err(Error::Invalid(
+                "USB device path contains a NUL character".into(),
+            ));
+        }
+        let name: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+        // Exclusive share mode 0: ownership extends across other OS processes.
         let handle = unsafe {
             CreateFileW(
-                wide.as_ptr(),
-                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                ptr::null(),
+                name.as_ptr(),
+                0xc0000000,
+                0,
+                null(),
                 OPEN_EXISTING,
                 0,
-                ptr::null_mut(),
+                null_mut(),
             )
         };
-
         if handle == INVALID_HANDLE_VALUE {
-            return Err(io::Error::last_os_error());
+            return Err(win_error("opening scanner; close other scanner clients"));
         }
-        debug!(?path, "Opened scanner");
-        Ok(Self { handle })
+        let mut transport = Self { handle, timeout: 0 };
+        let descriptor = transport.ioctl(6, &[], 8)?;
+        let ids = descriptor
+            .get(..4)
+            .ok_or_else(|| Error::Driver("Truncated USB device descriptor".into()))?;
+        let vid = u16::from_le_bytes([ids[0], ids[1]]);
+        let pid = u16::from_le_bytes([ids[2], ids[3]]);
+        scanner_model(vid, pid)
+            .ok_or_else(|| Error::Driver(format!("Unsupported USB scanner {vid:04x}:{pid:04x}")))?;
+        let pipes = transport.ioctl(10, &[], 68)?;
+        if pipes.len() < 4 {
+            return Err(Error::Driver("Truncated USB pipes".into()));
+        }
+        let count = u32::from_le_bytes(pipes[..4].try_into().unwrap()) as usize;
+        if count > 8 || pipes.len() < 4 + count * 8 {
+            return Err(Error::Driver("Invalid USB pipe count".into()));
+        }
+        let (mut inbound, mut outbound) = (0, 0);
+        for entry in pipes[4..4 + count * 8].as_chunks::<8>().0 {
+            if u32::from_le_bytes(entry[4..8].try_into().unwrap()) == 2 {
+                if entry[2] & 128 != 0 {
+                    inbound += 1;
+                } else {
+                    outbound += 1;
+                }
+            }
+        }
+        if (inbound, outbound) != (1, 1) {
+            return Err(Error::Driver("Expected one bulk IN and OUT pipe".into()));
+        }
+        transport.set_timeout(Duration::from_secs(10))?;
+        Ok(transport)
     }
-}
-
-impl Drop for ScsiScanDevice {
-    fn drop(&mut self) {
-        // SAFETY: `handle` came from a successful `CreateFileW` and nothing else closes it
-        let _ = unsafe { CloseHandle(self.handle) };
-    }
-}
-
-impl Transport for ScsiScanDevice {
-    fn max_transfer(&self) -> usize {
-        MAX_TRANSFER
-    }
-
-    // `timeout` is ignored: `SCSISCAN_CMD` has no timeout field
-    #[instrument(skip_all, fields(cdb = ?cdb, ?data))]
-    fn execute(&mut self, cdb: &[u8], data: Data, _timeout: Duration) -> Result<Completion, Error> {
-        if cdb.len() > 16 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "SCSISCAN_CMD carries at most a 16-byte CDB",
+    fn ioctl(&mut self, index: u32, bytes: &[u8], size: usize) -> Result<Vec<u8>> {
+        let input_length = u32::try_from(bytes.len())
+            .map_err(|_| Error::Invalid("USB control input too large".into()))?;
+        let output_length = u32::try_from(size)
+            .map_err(|_| Error::Invalid("USB control output too large".into()))?;
+        let mut output = vec![0u8; size];
+        let mut count = 0;
+        let ok = unsafe {
+            DeviceIoControl(
+                self.handle,
+                0x80002000 + index * 4,
+                if bytes.is_empty() {
+                    null()
+                } else {
+                    bytes.as_ptr().cast()
+                },
+                input_length,
+                if size == 0 {
+                    null_mut()
+                } else {
+                    output.as_mut_ptr().cast()
+                },
+                output_length,
+                &mut count,
+                null_mut(),
             )
-            .into());
-        }
-
-        let mut srb_status = 0u8;
-        let mut sb = [0u8; SENSE_LENGTH];
-
-        let mut padded = [0u8; 16];
-        padded[..cdb.len()].copy_from_slice(cdb);
-
-        let (srb_flags, data_ptr, data_len) = match data {
-            Data::None => (SRB_FLAGS_NO_DATA, ptr::null_mut(), 0usize),
-            Data::In(x) => (SRB_FLAGS_DATA_IN, x.as_mut_ptr(), x.len()),
-            Data::Out(x) => (SRB_FLAGS_DATA_OUT, x.as_ptr() as *mut u8, x.len()),
         };
-
-        let mut cmd = ScsiScanCmd {
-            reserved1: 0,
-            size: size_of::<ScsiScanCmd>() as u32,
-            srb_flags,
-            cdb_length: cdb.len() as u8,
-            sense_length: SENSE_LENGTH as u8,
-            reserved2: 0,
-            reserved3: 0,
-            transfer_length: data_len as u32,
-            cdb: padded,
-            srb_status: &mut srb_status,
-            sense_buffer: sb.as_mut_ptr(),
-        };
-
-        let mut returned = 0u32;
-        let mut attempt = 0;
-        loop {
-            // SAFETY: `handle` is open for the life of `self`. `cmd` is fully initialized on
-            // this stack frame, and its `srb_status`/`sense_buffer` pointers borrow locals that
-            // outlive the call. The data buffer is passed with its own length, so the driver
-            // cannot map past it. `METHOD_OUT_DIRECT` means that buffer is the *output*
-            // parameter whichever way the data actually flows.
-            let ok = unsafe {
-                DeviceIoControl(
-                    self.handle,
-                    IOCTL_SCSISCAN_CMD,
-                    (&raw mut cmd).cast(),
-                    size_of::<ScsiScanCmd>() as u32,
-                    data_ptr.cast(),
-                    data_len as u32,
-                    &mut returned,
-                    ptr::null_mut(),
-                )
-            };
-
-            if ok != 0 {
-                break;
-            }
-
-            // Direct I/O could not lock the buffer
-            let e = io::Error::last_os_error();
-            if e.raw_os_error() != Some(ERROR_WORKING_SET_QUOTA as i32) || attempt >= QUOTA_RETRIES
-            {
-                return Err(e.into());
-            }
-            attempt += 1;
-            debug!(attempt, "Working set quota exceeded, retrying");
-            sleep(QUOTA_RETRY_DELAY);
+        if ok == 0 {
+            return Err(win_error("usbscan IOCTL"));
         }
+        if count as usize > size {
+            return Err(Error::Protocol("Oversized IOCTL result".into()));
+        }
+        output.truncate(count as usize);
+        Ok(output)
+    }
+    fn set_timeout(&mut self, timeout: Duration) -> Result<()> {
+        if timeout.is_zero() || timeout > Duration::from_secs(214) {
+            return Err(Error::Invalid(
+                "usbscan timeout must be >0 and <=214 seconds".into(),
+            ));
+        }
+        // usbscan.sys accepts whole seconds, so subsecond deadlines round up.
+        let secs = timeout.as_secs_f64().ceil().clamp(1., 214.) as u32;
+        if secs != self.timeout {
+            let values: Vec<_> = [secs; 3].into_iter().flat_map(u32::to_le_bytes).collect();
+            self.ioctl(11, &values, 0)?;
+            self.timeout = secs;
+        }
+        Ok(())
+    }
+}
+impl Transport for UsbscanTransport {
+    fn read(&mut self, size: usize, timeout: Duration) -> Result<Vec<u8>> {
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        self.set_timeout(timeout)?;
+        let length =
+            u32::try_from(size).map_err(|_| Error::Invalid("USB read too large".into()))?;
+        let mut buffer = vec![0u8; size];
+        let mut count = 0;
+        if unsafe {
+            ReadFile(
+                self.handle,
+                buffer.as_mut_ptr(),
+                length,
+                &mut count,
+                null_mut(),
+            )
+        } == 0
+        {
+            return Err(win_error("reading scanner"));
+        }
+        if count > length {
+            return Err(Error::Protocol("Oversized USB read result".into()));
+        }
+        buffer.truncate(count as usize);
+        Ok(buffer)
+    }
+    fn write(&mut self, bytes: &[u8], timeout: Duration) -> Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        self.set_timeout(timeout)?;
+        let length =
+            u32::try_from(bytes.len()).map_err(|_| Error::Invalid("USB write too large".into()))?;
+        let mut count = 0;
+        if unsafe { WriteFile(self.handle, bytes.as_ptr(), length, &mut count, null_mut()) } == 0 {
+            return Err(win_error("writing scanner"));
+        }
+        if count > length {
+            return Err(Error::Protocol("Oversized USB write result".into()));
+        }
+        Ok(count as usize)
+    }
+}
 
-        trace!(
-            srb_status = format!("0x{srb_status:02x}"),
-            returned, attempt, "SCSISCAN_CMD completed"
+#[cfg(test)]
+mod tests {
+    use super::usb_ids_from_path;
+
+    #[test]
+    fn device_path_ids_are_case_insensitive_and_exact() {
+        assert_eq!(
+            usb_ids_from_path(r"\\?\USB#VID_04B8&PID_0151#scanner"),
+            Some((0x04b8, 0x0151))
         );
-
-        // There is no SCSI status byte in this struct, so the status is inferred from the SRB
-        let status = match srb_status & SRB_STATUS_MASK {
-            SRB_STATUS_SUCCESS => Status::Good,
-            SRB_STATUS_ERROR => Status::CheckCondition,
-            SRB_STATUS_BUSY => Status::Busy,
-            // A bus or driver level fault
-            _ => {
-                return Err(io::Error::other(format!(
-                    "SCSI bus fault: srb_status {srb_status:#04x}"
-                ))
-                .into());
-            }
-        };
-
-        let sense = if srb_status & SRB_STATUS_AUTOSENSE_VALID != 0 {
-            debug!(sense_raw = ?sb, "raw sense buffer");
-            // The driver reports no written length, so the fields are read at their
-            // fixed-format offsets and the whole 32 bytes are kept verbatim
-            if !matches!(sb[0] & 0x7F, 0x70 | 0x71) {
-                warn!(
-                    response_code = sb[0],
-                    "autosense buffer is not fixed-format"
-                );
-            }
-            // Same byte the sg path uses. Confirmed on an LS-9000: this
-            // driver reports 02h-04h-01h and 06h-28h-00h each carrying
-            // their documented 01h here, so both repack SBP-2 quadlet 5 to
-            // bytes 15-17 the same way
-            Some(sense_from_fixed(&sb, Some(sb[15])))
-        } else {
-            None
-        };
-
-        if status == Status::CheckCondition && sense.is_none() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "CHECK CONDITION without autosense",
-            )
-            .into());
-        }
-
-        Ok(Completion {
-            status,
-            sense,
-            transferred: returned as usize,
-        })
+        assert_eq!(usb_ids_from_path("vid_04b8&pid_01512"), None);
+        assert_eq!(usb_ids_from_path("vid_04b8&pid_xyz1"), None);
+        assert_eq!(usb_ids_from_path("vid_04b8"), None);
     }
 }

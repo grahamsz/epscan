@@ -1,20 +1,19 @@
 /target
+/.build
+/.holder-debug
+/.holder-continuous
+/.holder-crops
+/.mono-default
+/.negpy-layout
+/.preview-300
+/.region-batch
+/.strip-failure
+/.ui-preview
+/dist
+/captures
 .direnv
-*.tiff
-nkscan-wb.txt
 result
-
-# LibreOffice lock files, from opening the specs
-.~lock.*#
-
-# The scratch dump protocol::decode's round-trip test reads when it is there
-scan.raw
-
-# Scratch dumps and logs a debugging run leaves behind
-ours.log
+*.tiff
+*.pyd
 *.log
-thumb.raw
-thumb.ppm
-thumb.pgm
-*.ppm
-*.pgm
+__pycache__/

@@ -1,230 +1,253 @@
-# nkscan
+# epscan
 
-[![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/activexray/nkscan/ci.yml)](https://github.com/activexray/nkscan/actions/workflows/ci.yml)
-[![Crates.io Version](https://img.shields.io/crates/v/nkscan)](https://crates.io/crates/nkscan)
-[![docs.rs](https://img.shields.io/docsrs/nkscan)](https://docs.rs/nkscan)
-[![PyPI Version](https://img.shields.io/pypi/v/nkscan)](https://pypi.org/project/nkscan/)
+Rust library, optional CLI, and Python bindings for direct Epson ESC/I USB
+acquisition. The first model profile is the Perfection V800/V850 family
+(`04b8:0151`, GT-X980/B8).
 
-A cross-platform and performant driver for Nikon (Coolscan) film scanners.
+This is loosely inspired by the coparalbe [nkscan](https://github.com/activexray/nkscan) project but given that the
+hardware is so different a lot gets replaced.
 
-## Installation
 
-There is no installer, just grab a binary for your system from the [releases](https://github.com/activexray/nkscan/releases/latest).
+## Build and CLI
 
-The MacOS binaries are not signed, so Gatekeeper will trigger and will prevent it from running.
-Clear that with `xattr -d com.apple.quarantine nkscan-aarch64-apple-darwin`, or build from source instead.
-
-### Building from Source
-
-If you have a rust toolchain installed, you can install straight from crates.io via
-
-```bash
-cargo install nkscan --features cli --locked
+```sh
+cargo build --release --locked --features cli --bin epscan
+cargo install --path . --locked --features cli
+epscan list
+epscan dump --output diagnostics.json
+epscan preview --source film-holder --rect "0,0,149,246" --basename captures/preview
+epscan scan --source film-holder --rect "10,30,40,80" --dpi 300 --depth 16 --basename captures/film
+epscan scan --source film-holder --rect "10,30,10,10;70,70,10,10" --dpi 3200 --measure-sharpness --basename captures/areas
+epscan scan --holder v800-35mm --frame "1-5,8-12" --overage 5 --dpi 3200 --basename captures/film
 ```
 
-which will put `nkscan` on your path.
+`--rect` takes one quoted argument containing `x,y,width,height` in millimetres
+relative to the selected source. Separate multiple areas with semicolons:
+`--rect "10,30,10,10;70,70,10,10"`. Quotes are required to keep the semicolon
+inside the argument in PowerShell and other shells. The old four-space-separated
+value syntax is no longer accepted.
+Coordinates round to pixels; width rounds down to the model's alignment (eight
+pixels on V800). Requested and effective geometry are recorded. Both `scan` and
+`preview` require either `--source` with `--rect`, or `--holder` with `--frame`;
+a bare command prints usage without opening the scanner. `scan` defaults to 300 dpi and RGB16 once those
+arguments are provided. `preview` uses the model's 100 dpi/8-bit preset,
+also defaulting to RGB. Source selection never silently changes to accommodate a larger area.
 
-Otherwise, clone the repo and `cargo build --release --features cli`.
+Use `--mode gray` (alias `--mode mono`) for true single-channel grayscale
+acquisition and grayscale TIFFs. It supports 8- and 16-bit scans, previews,
+holder batches, and sharpness measurement. For example:
 
-If you have nix installed, you can build with `nix build`.
-We have the package defined in the flake, so you can add this to your personal config, if you wish.
-
-### Python
-
-To use the library from Python, install it with `pip install nkscan`.
-Refer to [PYTHON.md](PYTHON.md) for the API and examples.
-
-## Example
-
-Say I'm batch scanning 6x6 color negatives on my Coolscan 9000 (the only Nikon scanner attached to my computer).
-I usually do 2x multisampling at the full native resolution with an IR pass.
-Additionally, I'll "lock" the exposure from the first frame so every frame is exposed the same off the scanner so I can perform roll analysis when I invert.
-To do this and scan my whole roll (with the program prompting between strips), I'd run
-
-``` bash
-nkscan scan --lock-ae --samples 2 --ir --format 66
+```powershell
+.\epscan.exe scan --holder v800-35mm --frame "1-18" --overage -50 --dpi 3200 --mode gray --film mono --measure-sharpness --basename position-4-mono
 ```
 
-![demo gif](docs/demo.gif)
+RGB remains the default. `--film mono` only labels the film; `--mode gray`
+selects the scanner's grayscale acquisition mode. Samples remain un-inverted.
+Grayscale transfers one third as many image bytes as RGB at the same geometry
+and bit depth; mechanical scan time may differ. JSON records `mode: "gray"`
+and a `gray` pass/result. The new grayscale path is covered by offline tests;
+hardware validation of this implementation is pending.
 
-## Options
+Both commands combine nearby vertical explicit areas into bounding-box scans:
+regions must overlap by half the narrower width and have gaps of at most 10 mm.
+Larger gaps, separate columns, and infrared or thumbnail jobs stay independent.
+Each output retains its exact requested pixel region and the given order,
+including repeated identical rectangles. All areas and passes are validated
+before any capture starts. Explicit areas require `--source` and cannot be
+combined with `--holder`, `--frame`, or `--overage`. A single area keeps filenames
+such as `film_1.tiff`; multiple areas use `film_area01_1.tiff`,
+`film_area02_1.tiff`, and separate sidecars. The final capture number advances
+to avoid overwriting existing files.
 
-<details>
-<summary><code>nkscan scan --help</code></summary>
+`--holder v800-35mm` selects the measured V800-family three-strip holder and its film
+source. Frames 1–6 run down the left strip, 7–12 down the middle, and 13–18 down
+the right in the unrotated preview. `--overage 5` adds 5% to both frame dimensions,
+centered (2.5% on each edge); `--overage -10` crops each dimension by 10%,
+also centered. The value must be finite and greater than -100%; the default is
+zero. Holder selection cannot be
+combined with `--rect`, and `--overage` requires holder selection. The positions
+are approximate: the holder was measured empty, so film placement may shift the
+actual images. See the [frame map and all 18 rectangles](docs/holders.md).
 
-```
-Perform a scan. Defaults to batch scanning with sensible defaults
+`--frame` accepts individual numbers and inclusive ranges, such as `1-5,8-12`.
+Results follow the requested order; duplicate frames are included once. Every frame is
+validated before scanning starts. Holder outputs include the position, for
+example `film_frame01_1.tiff`, with a separate sidecar for each frame. For either
+frame or area batches, a failure stops the batch and keeps its raw data and
+traces, including completed captures.
+Successful batches use the same cleanup policy as single scans.
 
-Usage: nkscan scan [OPTIONS] [DEVICE]
+For single-pass RGB or grayscale scans and previews, multiple selected frames on the same
+registered strip share one acquisition. The V800 strips are frames 1–6, 7–12,
+and 13–18. Each acquisition covers the selected frames' bounding region,
+including any gaps; each output is then cropped to its own planned pixel
+rectangle with its overage applied. Samples are copied exactly, and sharpness
+is measured separately on each resulting frame. IR or thumbnail jobs and
+explicit rectangles keep separate acquisitions. Shared captures retain a
+`film_strip01_1.json` provenance sidecar alongside the individual frame outputs;
+their raw payload and trace are removed only after all frame outputs succeed,
+unless `--keep-intermediates` is set. See [holder batching](docs/holders.md).
 
-Arguments:
-  [DEVICE]
-          The scanner to connect to. Optional, will default to the first found
+`--measure-sharpness` records Tenengrad and variance of Laplacian for each main RGB or grayscale
+image, including each explicit area in a batch. Use the same regions and scan
+settings to compare manually adjusted holder heights, with a distinct basename
+such as `captures/position-4` for each setting.
+Negative overage can keep holder edges out of the measurement. See the
+[sharpness comparison workflow and metric definitions](docs/sharpness.md).
 
-Options:
-      --basename <BASENAME>
-          Where to write, as a path prefix. Each frame becomes <basename>_<n>.tiff, and its infrared mask <basename>_<n>_IR.tiff
-          
-          [default: scan]
+Use `--reduce-banding` to reduce vertical stripes in the exported RGB or grayscale
+TIFF. It estimates repeating column variations and their strength across the
+unrotated image, then applies a multiplicative correction to dark areas of the
+negative. The defaults are **80% correction strength**, a full darkness mask below
+10% of the original sample range, and a smooth fade to zero at **60% brightness**.
+Bright pixels at or above that cutoff stay unchanged. Original orientation, DPI,
+dimensions and sample depth are retained, including 16-bit output.
 
-      --unlock-wb
-          Autoexpose per channel, taking the film's own cast off. The default for color negative, where that cast is the orange mask
-
-      --lock-wb
-          Autoexpose the channels as one, keeping the film's cast and the factory balance. The default for slide, Kodachrome and black and white
-
-      --lock-ae
-          Autoexpose the first frame and reuse that exposure across all frames
-
-      --dpi <DPI>
-          Resolution. Defaults to scanner maximum
-
-      --log <LOG>
-          Log verbosity: trace, debug, info, warn, error, or off
-          
-          [default: info]
-
-      --samples <SAMPLES>
-          Number of samples. Defaults to 1
-          
-          [default: 1]
-
-      --superfine
-          Singleline CCD mode. Only supported on multiline CCD scanners
-
-      --frames <FRAMES>
-          Which frame(s) to scan, comma separated. Defaults to all detected. Naming any stops after one holder rather than batching
-
-      --ir
-          Include the IR pass
-
-      --clean
-          Remove dust and scratches using the infrared channel
-
-      --no-eject
-          Don't eject at the end of the strip
-
-      --thumbnail
-          Keep the framing thumbnail as <basename>_<n>_thumbnail.tiff, on units that support this
-
-      --format <FORMAT>
-          Film format. One of: 135, half, IX240, 16, 645, 66, 67, 68, 69, or a custom frame length in mm. Defaults to what the holder reports (if any)
-
-      --film <FILM>
-          Film type, which picks the color profile the scans are tagged with
-
-          Possible values:
-          - positive:   Slide film
-          - negative:   Color negative
-          - kodachrome: Kodachrome, whose dyes need their own profile
-          - mono:       Black and white negative
-          
-          [default: negative]
-
-  -h, --help
-          Print help (see a summary with '-h')
+```powershell
+epscan scan --holder v800-35mm --frame "1" --dpi 3200 --depth 16 --reduce-banding --save-raw-tiff --save-band-signal --basename captures/film
 ```
 
-</details>
+With this example, `film_frame01_1.tiff` is the corrected output,
+`film_frame01_1_raw.tiff` preserves the uncorrected samples, and
+`film_frame01_1_banding.png` visualizes the signed correction actually applied
+after the darkness mask and strength. The PNG is a reduced diagnostic preview;
+each panel preserves the image's aspect ratio, with separate R/G/B panels for
+color scans. Red indicates positive log-gain removed (samples darkened), blue
+indicates negative log-gain removed (samples brightened), and white means zero.
+JSON metadata records the
+configuration, detected bands and output paths. Optional exports must finish
+successfully before the CLI removes intermediate raw `.bin` payloads.
 
-## Support
+Tune `--banding-strength 0.8`, `--banding-dark-full 0.1`, and
+`--banding-dark-off 0.6` as fractions from 0 to 1; the full-mask threshold must
+be below the cutoff. `--banding-roi "X0,X1,Y0,Y1"` restricts frequency detection
+to a half-open region in original output pixels, useful for choosing a smooth
+sky or dense area instead of periodic scene detail. Correction still covers the
+whole image. These options and the optional exports require `--reduce-banding`,
+which also works with `preview` and holder/area batches. It conflicts with
+`--raw-only` and `--ir-only`; an additional IR pass is left uncorrected. Inspect
+the corrected and raw images when tuning: genuine repeating image detail can
+be mistaken for scanner bands. See [the algorithm and limitations](docs/banding-correction.md).
 
-Our goal is to support all the scanners supported by Nikon Scan, which are enumerated here by testing status.
-This library doesn't have anything scanner or adapter-specific so *theoretically* it should work across devices.
+| Source | Placement | Manufacturer optical rating |
+| --- | --- | --- |
+| `transparency` / `film-holder` | Film in holders | 6400 dpi |
+| `transparency-8x10` / `film-area-guide` | Film on glass with area guide | 4800 dpi |
+| `flatbed` | Reflective original on glass | 4800 dpi |
 
-If you test with a ⚠️-marked scanner/adapter combo and it works, please send a PR indicating support!
+These describe the intended optical path. Physical lens selection seems to happen
+at hardware discreption. Output DPI is a separate request, limited by both the
+model profile and the scanner's identity response.
 
-- ✅ Supported, and run against real hardware
-- ⚠️ Untested but theoretically should work
+`scan --help` lists the Epson options. `--thumbnail` adds a preview of the same
+region. Successful CLI scans and previews keep TIFF images and JSON metadata by
+default. Once the whole job finishes successfully, the CLI removes its raw `.bin`
+files and `.protocol.jsonl` trace. Use `--keep-intermediates` to retain those files
+alongside the TIFFs. `--raw-only` keeps raw payloads and JSON metadata without
+exporting TIFF; combine it with `--keep-intermediates` to keep the protocol trace
+too. Failed or cancelled jobs retain all available payloads and diagnostics.
+Cleanup updates the JSON sidecar and optional JSON result to reflect retained files;
+TIFF-embedded metadata remains the original acquisition record. If cleanup
+cannot finish, the CLI reports the remaining files without discarding the images.
 
-### Medium Format Scanners
+Gamma defaults to `device-default` for scans, previews and library settings.
+It selects the scanner's built-in tone curve and sends no LUT uploads. Use
+`--gamma identity-lut` to explicitly upload neutral custom tables instead.
+Neither mode establishes measured sensor linearity. Reset preserves uploaded
+tables, but the built-in mode does not select them. `--film` records a media label
+and never inverts or applies a colour profile.
 
-| Scanner \ Holder | 835M | 835S | 869S  | 869G  | 869GR  | 869M | 816 | 8G1 |
-|------------------|:----:|:----:|:-----:|:-----:|:------:|:----:|:---:|:---:|
-| Super Coolscan 9000 (LS-9000 ED)   | ⚠️  |  ⚠️   | ✅   | ⚠️   |  ⚠️   |  ⚠️ | ⚠️ |  ⚠️ |
-| Super Coolscan 8000 (LS-8000 ED)   | ⚠️  |  ⚠️   | ✅   | ✅   |  ⚠️   |  ⚠️ | ⚠️ |  ⚠️ |
+`--ir` adds an experimental separate IR8 pass; `--ir-only` requests only IR8.
+`--ir-gamma` selects its tone table. IR is limited to the primary holder source
+and rejected for `--film mono`. No IR16, dust cleaning, arbitrary focus, sensor
+exposure, motorized film transport, eject, or multisampling controls are
+advertised. VueScan's published Epson row-averaging method is documented as a
+future implementation lead in [the research notes](docs/sources.md).
 
-### 35mm Scanners
+The CLI rejects conflicting or unused options (for example visible-image mode or depth with
+`--ir-only`). Library calls preflight every planned pass before capture. Use
+`--io-timeout` for response/block reads, `--scan-timeout` for image acquisition,
+and `--settle-seconds` for the delay between passes. That delay is not a readiness
+guarantee. Ctrl+C requests cancellation at the next safe transfer boundary.
 
-| Scanner \ Holder                    | SA-21  | IA-20/21  | MA-20/21   | SA-30  | SF-210/200  |
-|-------------------------------------|:------:|:---------:|:----------:|:------:|:-----------:|
-| Super Coolscan 5000 (LS-5000 ED)    |   ⚠️   |  ⚠️      |    ✅     |  ⚠️    |   ⚠️       |
-| Super Coolscan 4000 (LS-4000 ED)    |   ✅   |  ⚠️      |    ⚠️     |  ✅    |   ⚠️       |
-| Coolscan V (LS-50 ED)               |   ✅   |  ✅      |    ✅     |  ✅    |   ✅       |
-| Coolscan IV (LS-40 ED)              |   ✅   |  ⚠️      |    ⚠️     |  ⚠️    |   ⚠️       |
+Interactive scans retain the original fork's progress bars: transferred bytes,
+throughput and ETA, with spinners during preparation, settling and saving.
+Progress and log messages share stderr without overwriting each other. Bars
+are hidden when stderr is redirected. Like the original fork, scans finish
+with a short status message giving dimensions, DPI and written filenames.
+Use `--json` on `scan` or `preview` to print the complete result to stdout for
+scripts; status messages stay on stderr. `--log` and `RUST_LOG` control status
+verbosity. The JSON sidecar is saved in either mode.
 
-If you want to use a Firewire scanner on an old Mac that still has OS support for FireWire, let me know and I can scope it out.
-It is technically possible, but getting Rust to compile a binary for older MacOS is not something I have experience in.
-You could also just like, install Linux on it :)
+One frame or explicit area keeps the single-result JSON shape. Multiple explicit
+areas produce `{"areas":[{"area":1,"result":{...}},...]}`; multiple holder frames
+produce `{"frames":[{"frame":1,"result":{...}},...]}`. Entries follow the requested
+selection order, and the combined JSON is printed only after the whole batch succeeds.
 
-### USB Scanner Drivers
+`--backend auto` prefers the installed Epson `usbscan.sys` driver on Windows;
+`--backend nusb` explicitly selects nusb. Windows nusb acquisition requires a
+compatible WinUSB binding. The program does not change drivers. Linux/macOS
+use nusb and need the appropriate device permissions. See [Windows notes](docs/windows.md).
 
-We use [nusb](https://github.com/kevinmehall/nusb), which is a pure-Rust alternative to libusb, but it carries the same invariants.
-On Windows, this means you need to associate your device with a WinUSB driver.
-The most popular way to do this is with [Zadig](https://zadig.akeo.ie/).
+## Rust library
 
-On Linux, make sure you have the appropriate udev rules set up. Nusb has some [help](https://docs.rs/nusb/latest/nusb/#linux) on this.
+The library does not require the `cli` or `python` features.
 
-MacOS *should* just work.
+```rust,no_run
+use epscan::{Backend, ScanOptions, ScanSettings, Session};
+use std::{path::Path, sync::atomic::AtomicBool, time::Duration};
 
-### FireWire Drivers
+fn main() -> epscan::Result<()> {
+    let mut scanner = Session::connect(None, Backend::Auto, Duration::from_secs(60))?;
+    let settings = ScanSettings { rect_mm: [10., 30., 40., 80.], ..Default::default() };
+    let options = ScanOptions::default();
+    let plan = options.plan(&settings, &scanner.capabilities)?;
+    println!("{} passes", plan.passes.len());
+    let result = scanner.scan(&settings, &options, Path::new("captures/film"),
+        &AtomicBool::new(false), &mut |p| { println!("{} {}/{}", p.phase, p.done, p.total); true })?;
+    println!("{}", result.manifest.display());
+    scanner.close();
+    Ok(())
+}
+```
 
-Things *should* just work on Linux (assuming you've got the [SG](https://www.kernel.org/doc/html/latest/scsi/scsi-generic.html) module loaded) and Windows.
-MacOS dropped support for FireWire in Tahoe, but the open source [ASFireWire](https://github.com/mrmidi/ASFireWire) project brings it back on Apple Silicon as a third-party dext.
-nkscan is tested and verified to work well with ASFireWire.
-If you have an older mac with FireWire on it, you could just install Linux and have an OS that respects your freedom.
+Library scans retain raw payloads and protocol traces; automatic cleanup is a
+CLI policy. Acquisition streams bounded blocks to numbered files: `<basename>_<n>.bin`,
+`.tiff`, `.json`, and `.protocol.jsonl`; IR and thumbnails add `_IR` and
+`_thumbnail`. Existing captures are not overwritten. Incomplete transfers remain
+`.partial.bin`; completed RGB is retained if a later IR pass fails. Results
+contain paths and metadata. `ImageResult::save_tiff` can export a raw-only result
+later. TIFF strips preserve sample values and little-endian raw data unless
+banding correction is explicitly enabled; large
+outputs select BigTIFF. Registration, inversion, normalization, and colour
+rendering are not applied. Errors during capture close the session.
 
-## Design Notes
+For Python 3.13+, build with `maturin develop --release`; see [PYTHON.md](PYTHON.md).
+The new Epson API intentionally replaces the cloned Nikon API.
 
-This library is written from the ground up following the official Nikon spec of the wire protocol for the LS-5000 and LS-9000 ED scanners (located in docs/).
-Comparing the two, we find an identical protocol.
-Some types are absent in one but not the other, some lists capabilities the other doesn't have, but all of the bits and bytes are in the same position across all the data.
-This implies we don't need any model or holder specifics, we can just read what the scanner advertises as its capabilities and work from there (for the most part).
-This means (hopefully) we can support every scanner and every holder with a single codebase (although please test and let me know)!
+## Adding scanners
 
-The code is broken down into several layers of independent abstractions
-- Transport: Defines what moving SCSI bytes is for the different OSes and physical layer (USB/FireWire)
-- Protocol: An implementation of the Nikon spec via serialization and deserialization of bytes as they come off the wire. This module does no IO and is just byte-oriented.
-- Session: Combines a trait object of the Transport (type erasure) with the methods from Protocol. This wraps scanner state (like global units) and provides functions that essentially perform the spec's listed actions.
-- Scan: Combine the methods from Session to perform high-level scan operations. This asks the scanner what it can do and then orders session operations to do it.
+Edit [src/capabilities.rs](src/capabilities.rs) for model IDs, identity aliases,
+command levels, supported sources/depths, optical ratings, source/focus requests,
+transfer policy, holder frame layouts, and continuous strip groups. Discovery, validation, diagnostics, and scan planning use
+that registry. Device-reported areas and limits further restrict each profile.
+Unknown models are rejected. Add captured identity and protocol fixtures before
+adding a model; a new protocol family may also need protocol/session support.
+See [the extension guide](docs/adding-scanners.md).
 
-### RE: LLMs
+## Validation and provenance
 
-I'd rather spend money on film than on tokens.
-While LLMs helped with the production of some of this crate, it was largely written by hand and not vibe-coded.
-If you contribute, please adhere to the [contribution guide](CONTRIBUTING.md).
+```sh
+cargo test --locked --all-targets --features cli
+cargo test --locked --doc
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo fmt --all -- --check
+```
 
-### Why Rust
-
-I'm impatient and don't have time for runtimes, garbage collection, and dumb compilers.
-I like types, memory safety, correctness, and speed.
-Rust's model fits this better than any language, plus it has great tooling and libraries for the low-level programming in this crate.
-For the CLI user, you get one ~5MB binary and *that's it*, no messing around.
-I'm not super interested in a GUI right now, but that's the library part of this code base.
-Please go make one (hopefully also in Rust)!
-
-## License
-
-Dual licensed under either of
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
-
-at your option.
-
-Except for the ICC profiles in [profiles/](profiles/README.md), which are
-derived from Nikon's and are not ours to license.
-
-Unless you explicitly state otherwise, any contribution intentionally submitted for
-inclusion in this work by you, as defined in the Apache-2.0 license, shall be dual licensed
-as above, without any additional terms or conditions.
-
-## Related Projects and References
-
-- [coolscanpy](https://github.com/rohanpandula/coolscanpy/)
-- [Coolscan RE](https://github.com/kevihiiin/Nikon-Coolscan-RE)
-- [coolscan-mods](https://github.com/kosma/coolscan-mods)
-- [sane-coolscan3](http://sane-project.org/man/sane-coolscan3.5.html)
-- [openICE](https://github.com/a6o/openICE)
-- [digital fauxice](https://github.com/rohanpandula/digital-fauxice)
-- [ScanStudio](https://github.com/rohanpandula/ScanStudio)
+Hardware testing on the GT-X980/B8 with Windows `usbscan.sys` reproduced a
+cold-start rejection: the first acquisition request returns `0x92` and triggers
+the scanner's reported warmup state. The model's recovery policy waits for
+confirmed readiness and permits one further start; cold and warm scans passed
+with the rebuilt CLI. See the [investigation and test results](docs/hardware-debug-2026-09-25.md)
+and [hardware coverage](docs/hardware-validation.md). Protocol research and
+acknowledgements are recorded in [the sources](docs/sources.md) and [NOTICE](NOTICE.md).

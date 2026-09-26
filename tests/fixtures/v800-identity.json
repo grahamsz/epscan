@@ -1,0 +1,82 @@
+{
+  "device": {
+    "location": "\\\\?\\usb#vid_04b8&pid_0151#fixture#{6bdd1fc6-810f-11d0-bec7-08002be2092f}",
+    "transport": "usbscan",
+    "name": "Epson V800/V850 family (model not yet queried)",
+    "vid": 1208,
+    "pid": 337
+  },
+  "capabilities": {
+    "model": "GT-X980",
+    "command_level": "B8",
+    "firmware": "1.10",
+    "basic_dpi": 4800,
+    "min_dpi": 25,
+    "max_dpi": 12800,
+    "max_width_pixels": 40800,
+    "input_depth": 16,
+    "max_output_depth": 16,
+    "flatbed_pixels": [
+      40800,
+      56160
+    ],
+    "transparency_pixels": [
+      28320,
+      46560
+    ],
+    "transparency_8x10_pixels": [
+      38400,
+      48000
+    ],
+    "infrared_advertised": true,
+    "infrared_implementation": "experimental_separate_pass",
+    "source_areas_mm": {
+      "flatbed": [
+        215.9,
+        297.18
+      ],
+      "transparency": [
+        149.86,
+        246.38
+      ],
+      "transparency-8x10": [
+        203.2,
+        254.0
+      ]
+    },
+    "implemented_depths": [
+      8,
+      16
+    ],
+    "dpi_range_is_advertised_not_measured_optical_resolution": true,
+    "eject": false,
+    "film_transport": false,
+    "autofocus": false
+  },
+  "status": {
+    "raw_hex": "01008000000000000080000000000000",
+    "fatal": false,
+    "busy": false,
+    "warming_up": false,
+    "transparency_installed": true,
+    "transparency_error": false,
+    "lid_open": false
+  },
+  "legacy_identity_hex": "4238523200523c00524800524b00525000525a0052640052780052850052900052960052a00052af0052b40052c80052d80052f000520a01522c01524001525e0152680152900152e00152580252d00252200352840352b00452400652080752600952800c41406a4092",
+  "extended_identity_hex": "42380000c01200001900000000320000609f0000609f000060db00000000000000000000a06e0000e0b50000871047542d58393830202020202020202020312e313010100096000080bb000000000000",
+  "parameters_hex": "64000000640000000000000000000000500300009204000000010000000100800080000000000000000000000000000000000000000000000000000000000000",
+  "usb_pipes": [
+    {
+      "max_packet": 512,
+      "endpoint": 1,
+      "interval": 0,
+      "type": 2
+    },
+    {
+      "max_packet": 512,
+      "endpoint": 130,
+      "interval": 0,
+      "type": 2
+    }
+  ]
+}

@@ -1,5 +1,13 @@
-## Nikon-official Wire Protocols
+# Epson library documentation
 
-Contained here are the original Nikon wire protocol documents for the LS-9000 and LS-50000 (thanks @kosma!).
-
-I've used pandoc to convert them to markdown so they could by read here.
+- [Adding scanners](adding-scanners.md)
+- [Holder frames and ranges](holders.md)
+- [Sharpness and holder-height comparisons](sharpness.md)
+- [Periodic band correction: Rust implementation guide](banding-correction.md)
+- [ESC/I wire contract](protocol.md)
+- [Hardware validation](hardware-validation.md)
+- [V800 cold-start investigation](hardware-debug-2026-09-25.md)
+- [Windows transports](windows.md)
+- [Sources and evidence](sources.md)
+- [Provenance](../NOTICE.md)
+- [Python interface](../PYTHON.md)

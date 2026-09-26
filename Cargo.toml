@@ -1,104 +1,49 @@
 [package]
-name = "nkscan"
-version = "0.12.0"
+name = "epscan"
+version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
-description = "A platform-agnostic, performant driver for Nikon film scanners"
-repository = "https://github.com/activexray/nkscan"
+description = "Direct Epson ESC/I scanner library and command-line interface"
 readme = "README.md"
-keywords = ["scanner", "film", "nikon", "coolscan", "scsi"]
+keywords = ["scanner", "film", "epson", "usb", "esci"]
 categories = ["hardware-support", "multimedia::images"]
-exclude = [
-  ".envrc",
-  ".github/",
-  "docs/*",
-  "flake.nix",
-  "flake.lock",
-  "nkscan.pyi",
-  "pyproject.toml",
-  "scripts/",
-  "scsi_proxy/",
-]
-
-[dependencies]
-thiserror = "2"
-bitflags = "2"
-nusb = "0.2"
-tracing = "0.1"
-wide = "1"
-rayon = "1"
-
-# Python library dependencies
-pyo3 = { version = "0.29", optional = true, features = ["abi3-py313"] }
-numpy = { version = "0.29", optional = true }
-pyo3-stub-gen = { version = "0.23", optional = true, default-features = false, features = [
-  "numpy",
-  "infer_signature",
-] }
-
-# cli deps
-anyhow = { version = "1", optional = true }
-tracing-subscriber = { version = "0.3", features = [
-  "env-filter",
-], optional = true }
-clap = { version = "4", features = ["derive"], optional = true }
-indicatif = { version = "0.18", optional = true }
-tiff = { version = "0.11", optional = true }
-moxcms = { version = "0.9", optional = true }
-ctrlc = { version = "3", optional = true }
-
-
-[features]
-cli = [
-  "dep:anyhow",
-  "dep:tracing-subscriber",
-  "dep:clap",
-  "dep:indicatif",
-  "dep:tiff",
-  "dep:moxcms",
-  "dep:ctrlc",
-]
-python = [
-  "dep:pyo3",
-  "dep:numpy",
-  "dep:pyo3-stub-gen",
-  "dep:tracing-subscriber",
-]
+include = ["/src/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE-*", "/NOTICE.md", "/docs/**", "/tests/fixtures/**", "/examples/*.rs", "/epscan.pyi", "/pyproject.toml", "/PYTHON.md"]
 
 [lib]
-name = "nkscan"
-path = "src/lib.rs"
-crate-type = ["cdylib", "rlib"] # For python support
-
-[target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.31", features = ["ioctl"] }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61", features = [
-  "Win32_Foundation",
-  "Win32_Storage_FileSystem",
-  "Win32_System_IO",
-  "Win32_System_Console",
-] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-core-foundation-sys = "0.8"
-io-kit-sys = "0.5"
+name = "epscan"
+crate-type = ["cdylib", "rlib"]
 
 [[bin]]
-name = "nkscan"
-path = "src/bin/nkscan/main.rs"
+name = "epscan"
+path = "src/bin/epscan/main.rs"
 required-features = ["cli"]
 
-[[bin]]
-name = "stub_gen"
-path = "src/bin/stub_gen.rs"
-required-features = ["python"]
+[features]
+default = []
+cli = ["dep:clap", "dep:tracing", "dep:tracing-subscriber", "dep:ctrlc", "dep:indicatif"]
+python = ["dep:pyo3"]
+
+[dependencies]
+nusb = "0.2.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tiff = { version = "0.11", default-features = false }
+sha2 = "0.10"
+log = "0.4"
+rustfft = "6.4"
+nalgebra = { version = "0.33", default-features = false, features = ["std"] }
+png = "0.17"
+clap = { version = "4", features = ["derive"], optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+ctrlc = { version = "3", optional = true }
+indicatif = { version = "0.18", optional = true }
+pyo3 = { version = "0.29", features = ["abi3-py313"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Devices_DeviceAndDriverInstallation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Console", "Win32_Security"] }
 
 [dev-dependencies]
-divan = "0.1.21"
-tiff = "0.11"
-
-[[bench]]
-name = "dust"
-harness = false
+tempfile = "3"
