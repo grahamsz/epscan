@@ -25,6 +25,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: release-${{ matrix.os }}-${{ matrix.target }}
       - name: Build and smoke test
         shell: bash
         run: |
