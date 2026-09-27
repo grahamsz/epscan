@@ -80,6 +80,18 @@ when that row exceeds the target. Small captures still use 32 rows. For a
 1512-column RGB16 strip, this requests 7 rows (63,504 data bytes) instead of
 32 rows (290,304 data bytes), without changing image geometry or samples.
 
+With `ScanSettings::y_oversampling > 1`, `dpi` still describes square output
+pixels. FS W requests X DPI=`dpi`, Y DPI=`dpi * y_oversampling`; Y offset and
+height are the rounded square pixel values multiplied by that factor. This
+keeps every cropped output row on the same acquisition sampling grid. The wire
+transfer contains the multiplied row count. A bounded writer averages each
+group before publishing the square packed payload; output metadata explicitly
+records this sample transform, while progress uses wire transfer counts.
+Only fully written average groups contribute to the streaming frame watermark.
+The V800/V850 carriage sampling cap is 9600 DPI from Epson's hardware
+specifications, intersected with connected-device and source limits. Its
+12800 DPI output maximum is not used as evidence of additional physical samples.
+
 This smaller-block policy is an **unverified mitigation**, following a long
 strip transfer that stalled two bytes short within a block. It is not a proven
 fix or a documented USB transfer limit. Earlier 16-line experiments had mixed
@@ -154,8 +166,17 @@ This deliberately fails on unknown padding/layout rather than guessing a stride.
 
 Each block contains its pixel bytes and one trailing status byte. RGB is packed
 R,G,B; 16-bit values are little-endian. Data streams to disk before TIFF encoding.
-TIFF samples were compared byte-for-byte against real payload files. No pixel
-rotation, inversion, resampling or RGB/IR registration is applied.
+TIFF samples were compared byte-for-byte against real payload files. With Y
+oversampling off, no resampling is applied. Pixel rotation, inversion and RGB/IR
+registration are not applied.
+
+On 2026-09-26, small empty-holder captures on the GT-X980 verified RGB16 at
+3200 x 9600 acquisition DPI (3x Y sampling) and grayscale16 at 4800 x 9600
+(2x). Parameter readback matched both requests. The RGB batch delivered two
+248 x 252 square-pixel frames plus their pre-banding originals; grayscale
+delivered 376 x 378 pixels. This verifies transfer geometry and output, not
+image-quality improvement. Local evidence is in
+`captures/y-sampling-20260926/verification.json`.
 
 A trailing fatal (80) or not-ready (40) status ends the device's image transfer,
 even when the advertised image has more blocks. The host sends neither ACK nor

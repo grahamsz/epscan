@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: MIT
 //! High-level pass planning, acquisition results and bounded file output.
 pub mod banding;
 pub mod crop;
@@ -7,10 +7,12 @@ pub mod holder;
 pub mod io;
 pub mod region_batch;
 pub mod regions;
+mod sampling;
 pub mod sharpness;
+mod stream;
 use crate::{
     Capabilities, Error, Gamma, Result, ScanMode, ScanSettings,
-    capabilities::{Holder, ScannerModel},
+    capabilities::{FrameFormat, Holder, ScannerModel},
     error::unsupported,
     session::image::ImageResult,
 };
@@ -21,6 +23,8 @@ use std::{path::PathBuf, time::Duration};
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct HolderSelection {
     pub holder: Holder,
+    /// Optional compatible exposure preset; omission uses the holder default.
+    pub frame_format: Option<FrameFormat>,
     /// One-based frame number in the selected holder layout.
     pub frame: u32,
     /// Signed total percentage change to width and height, centered on the
@@ -30,8 +34,8 @@ pub struct HolderSelection {
 
 impl HolderSelection {
     fn validate(self, settings: &ScanSettings, model: &ScannerModel) -> Result<()> {
-        let layout = model.holder(self.holder)?;
-        let rectangle = model.holder_frame(self.holder, self.frame, self.overage_percent)?;
+        let layout = model.holder(self.holder)?.for_format(self.frame_format)?;
+        let rectangle = layout.frame_rect(self.frame, self.overage_percent)?;
         if settings.source != layout.source {
             return Err(Error::Invalid(format!(
                 "Holder selection requires source {:?}, but scan settings use {:?}",
@@ -54,17 +58,15 @@ impl HolderSelection {
     }
 
     fn metadata(self, model: &ScannerModel) -> Result<serde_json::Value> {
-        let layout = model.holder(self.holder)?;
+        let layout = model.holder(self.holder)?.for_format(self.frame_format)?;
         let mut metadata = serde_json::to_value(self)?;
+        metadata["frame_format"] =
+            serde_json::to_value(self.frame_format.or(layout.default_format))?;
         metadata["layout"] = layout.name.into();
         metadata["source"] = serde_json::to_value(layout.source)?;
-        metadata["nominal_rect_mm"] =
-            serde_json::to_value(model.holder_frame(self.holder, self.frame, 0.0)?)?;
-        metadata["rect_mm"] = serde_json::to_value(model.holder_frame(
-            self.holder,
-            self.frame,
-            self.overage_percent,
-        )?)?;
+        metadata["nominal_rect_mm"] = serde_json::to_value(layout.frame_rect(self.frame, 0.0)?)?;
+        metadata["rect_mm"] =
+            serde_json::to_value(layout.frame_rect(self.frame, self.overage_percent)?)?;
         metadata["overage_semantics"] =
             "signed total width and height change, centered; positive expands and negative crops equally on both edges".into();
         Ok(metadata)
@@ -226,6 +228,7 @@ impl ScanOptions {
         if self.thumbnail {
             let mut preview = settings.clone();
             preview.dpi = model.preview_dpi;
+            preview.y_oversampling = 1;
             preview.depth = model.preview_depth;
             preview.preview = true;
             requested.push((PassKind::Thumbnail, preview));
@@ -269,6 +272,9 @@ impl ScanOptions {
                 .and_then(|n| n.checked_mul(u64::from(channels)))
                 .and_then(|n| n.checked_mul(u64::from(settings.depth / 8)))
                 .ok_or_else(|| Error::Invalid("Capture size overflow".into()))?;
+            expected_bytes
+                .checked_mul(u64::from(settings.y_oversampling))
+                .ok_or_else(|| Error::Invalid("Y acquisition size overflow".into()))?;
             passes.push(PlannedPass {
                 kind,
                 settings,
@@ -311,6 +317,36 @@ mod tests {
             .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
             .collect();
         Capabilities::parse(&bytes).unwrap()
+    }
+
+    #[test]
+    fn extra_sampling_preserves_ir_registration_and_resets_automatic_thumbnails() {
+        let options = ScanOptions {
+            infrared: true,
+            thumbnail: true,
+            banding: Some(banding::BandingOptions::default()),
+            ..Default::default()
+        };
+        let settings = ScanSettings {
+            dpi: 3200,
+            y_oversampling: 3,
+            ..Default::default()
+        };
+        let plan = options.plan(&settings, &capabilities()).unwrap();
+        assert_eq!(plan.passes[0].settings.y_oversampling, 1);
+        assert_eq!(plan.passes[1].settings.acquisition_y_dpi().unwrap(), 9600);
+        assert_eq!(plan.passes[2].settings.acquisition_y_dpi().unwrap(), 9600);
+        assert_eq!(plan.passes[1].pixels, plan.passes[2].pixels);
+        assert_eq!(
+            plan.passes[1]
+                .settings
+                .acquisition_pixels_for(&crate::capabilities::V800_FAMILY)
+                .unwrap(),
+            plan.passes[2]
+                .settings
+                .acquisition_pixels_for(&crate::capabilities::V800_FAMILY)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -548,6 +584,7 @@ mod tests {
         let model = caps.scanner_model().unwrap();
         let selection = HolderSelection {
             holder: Holder::V800Film35mm,
+            frame_format: None,
             frame: 1,
             overage_percent: 5.0,
         };
@@ -593,6 +630,7 @@ mod tests {
             let options = ScanOptions {
                 holder_selection: Some(HolderSelection {
                     holder: Holder::V800Film35mm,
+                    frame_format: None,
                     frame,
                     overage_percent,
                 }),
@@ -606,11 +644,58 @@ mod tests {
     }
 
     #[test]
+    fn format_metadata_records_resolved_preset_and_its_geometry() {
+        let model = crate::capabilities::V800_FAMILY;
+        for (holder, frame_format, expected) in [
+            (Holder::V800Film35mm, None, "35mm"),
+            (
+                Holder::V800Film35mm,
+                Some(FrameFormat::Film35mmHalf),
+                "35mm-half",
+            ),
+            (Holder::V800MediumFormat, None, "6x6"),
+            (
+                Holder::V800MediumFormat,
+                Some(FrameFormat::Film6x45),
+                "6x4.5",
+            ),
+        ] {
+            let selection = HolderSelection {
+                holder,
+                frame_format,
+                frame: 1,
+                overage_percent: -10.0,
+            };
+            let metadata = selection.metadata(&model).unwrap();
+            assert_eq!(metadata["frame_format"], expected);
+            assert_eq!(
+                metadata["nominal_rect_mm"],
+                serde_json::to_value(
+                    model
+                        .holder_frame_with_format(holder, frame_format, 1, 0.0)
+                        .unwrap()
+                )
+                .unwrap()
+            );
+            assert_eq!(
+                metadata["rect_mm"],
+                serde_json::to_value(
+                    model
+                        .holder_frame_with_format(holder, frame_format, 1, -10.0)
+                        .unwrap()
+                )
+                .unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn negative_holder_overage_is_valid_and_recorded_as_a_centered_crop() {
         let caps = capabilities();
         let model = caps.scanner_model().unwrap();
         let selection = HolderSelection {
             holder: Holder::V800Film35mm,
+            frame_format: None,
             frame: 1,
             overage_percent: -10.0,
         };

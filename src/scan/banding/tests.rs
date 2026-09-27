@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: MIT
 use super::*;
 use std::f64::consts::TAU;
 use tiff::decoder::{Decoder, DecodingResult};
@@ -69,6 +69,100 @@ fn decode(path: &Path) -> (Vec<u16>, serde_json::Value, [u32; 2]) {
 }
 
 #[test]
+fn shared_fit_exports_match_full_corrected_pixels_at_nonzero_crop_origins() {
+    for (channels, depth) in [(1, 16), (3, 8)] {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut source, original) = fixture(directory.path(), channels, depth, true);
+        let source_bytes = std::fs::read(&source.payload).unwrap();
+        let options = BandingOptions {
+            save_raw: true,
+            save_signal: true,
+            ..Default::default()
+        };
+        let cancel = AtomicBool::new(false);
+        let fitted = PreparedBanding::prepare(&source, &options, &cancel).unwrap();
+        let full_path = directory.path().join("full.tiff");
+        export_prepared(&mut source, &full_path, &fitted, [0, 0], false, &cancel).unwrap();
+        let full = decode(&full_path).0;
+        assert_ne!(full, original);
+        for (index, [x, y, width, height]) in [[31, 43, 173, 127], [12, 246, 180, 119]]
+            .into_iter()
+            .enumerate()
+        {
+            let slice = |values: &[u16]| {
+                let mut cropped = Vec::new();
+                for row in y..y + height {
+                    let start = (row * source.width + x) as usize * channels as usize;
+                    cropped.extend_from_slice(
+                        &values[start..start + width as usize * channels as usize],
+                    );
+                }
+                cropped
+            };
+            let raw_crop = slice(&original);
+            let packed: Vec<u8> = if depth == 16 {
+                raw_crop
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect()
+            } else {
+                raw_crop.iter().map(|value| *value as u8).collect()
+            };
+            let payload = directory.path().join(format!("crop{index}.bin"));
+            std::fs::write(&payload, &packed).unwrap();
+            let original_metadata =
+                serde_json::json!({"sample_transform":"none; exact packed samples"});
+            let mut crop = ImageResult {
+                payload,
+                tiff: None,
+                width,
+                height,
+                channels,
+                depth,
+                dpi: source.dpi,
+                metadata: original_metadata.clone(),
+            };
+            let output = directory.path().join(format!("crop{index}.tiff"));
+            fitted
+                .export_crop(&mut crop, [x, y], &output, &cancel)
+                .unwrap();
+            let (corrected, metadata, dimensions) = decode(&output);
+            assert_eq!(dimensions, [width, height]);
+            assert_eq!(corrected, slice(&full));
+            assert_eq!(metadata["banding"]["analysis_scope"], "shared_capture");
+            assert_eq!(
+                metadata["banding"]["analysis_source"]["width"],
+                source.width
+            );
+            assert_eq!(
+                metadata["banding"]["analysis_source"]["height"],
+                source.height
+            );
+            assert_eq!(
+                metadata["banding"]["crop_pixels"],
+                serde_json::json!([x, y, width, height])
+            );
+            assert_eq!(
+                metadata["banding"]["signal_preview"]["model_origin"],
+                serde_json::json!([x, y])
+            );
+            let (raw, raw_metadata, _) =
+                decode(&directory.path().join(format!("crop{index}_raw.tiff")));
+            assert_eq!(raw, raw_crop);
+            assert_eq!(raw_metadata, original_metadata);
+            assert_eq!(std::fs::read(&crop.payload).unwrap(), packed);
+            assert!(
+                directory
+                    .path()
+                    .join(format!("crop{index}_banding.png"))
+                    .is_file()
+            );
+        }
+        assert_eq!(std::fs::read(&source.payload).unwrap(), source_bytes);
+    }
+}
+
+#[test]
 fn exports_preserve_raw_and_protected_samples_with_truthful_metadata() {
     for (channels, depth) in [(1, 16), (3, 8)] {
         let directory = tempfile::tempdir().unwrap();
@@ -85,7 +179,22 @@ fn exports_preserve_raw_and_protected_samples_with_truthful_metadata() {
         export(&mut image, &output, &options, &AtomicBool::new(false)).unwrap();
         assert_eq!(image.tiff.as_ref(), Some(&output));
         assert_eq!(image.metadata["banding"]["status"], "corrected");
-        assert_eq!(image.metadata["banding"]["config"]["strength"], 0.8);
+        assert_eq!(image.metadata["banding"]["config"]["strength"], 1.0);
+        assert_eq!(image.metadata["banding"]["method_version"], 2);
+        assert_eq!(
+            image.metadata["banding"]["model"],
+            "residual_refined_linear_sine"
+        );
+        let refinement = image.metadata["banding"]["residual_refinement"]
+            .as_array()
+            .unwrap();
+        assert_eq!(refinement.len(), channels as usize);
+        for channel in refinement {
+            assert!(
+                channel["residual_rms_after"].as_f64().unwrap()
+                    <= channel["residual_rms_before"].as_f64().unwrap()
+            );
+        }
         assert_eq!(
             image.metadata["sample_transform"],
             original_metadata["sample_transform"]

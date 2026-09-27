@@ -291,11 +291,10 @@ dependencies = [
  "ctrlc",
  "indicatif",
  "log",
- "nalgebra",
+ "negative-banding",
  "nusb",
  "png",
  "pyo3",
- "rustfft",
  "serde",
  "serde_json",
  "sha2",
@@ -542,6 +541,18 @@ dependencies = [
  "num-traits",
  "simba",
  "typenum",
+]
+
+[[package]]
+name = "negative-banding"
+version = "0.1.0"
+dependencies = [
+ "nalgebra",
+ "rustfft",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

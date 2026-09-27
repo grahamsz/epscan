@@ -1,11 +1,11 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: MIT
 //! Discover supported Epson scanners without opening them or changing drivers.
 #[cfg(not(windows))]
 use crate::Error;
 use crate::transport::usb;
 #[cfg(windows)]
 use crate::transport::windows;
-use crate::{Result, capabilities::scanner_model};
+use crate::{Result, capabilities::discovery_name};
 use nusb::MaybeFuture;
 use serde::Serialize;
 
@@ -48,10 +48,10 @@ pub fn list_devices(backend: Backend) -> Result<Vec<Device>> {
         .wait()
         .map_err(usb::operation_error)?
         .filter_map(|d| {
-            let model = scanner_model(d.vendor_id(), d.product_id())?;
+            let name = discovery_name(d.vendor_id(), d.product_id())?;
             Some(Device {
                 location: nusb_location(&d),
-                name: d.product_string().unwrap_or(model.name).to_owned(),
+                name: name.to_owned(),
                 vid: d.vendor_id(),
                 pid: d.product_id(),
                 backend: Backend::Nusb,

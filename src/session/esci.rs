@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: MIT
 //! Host transactions against the wire contract in docs/protocol.md.
 use super::now;
 use crate::{
@@ -368,7 +368,7 @@ impl Esci {
                     "{position}: scanner ended the image transfer with {fault}; no ACK or CAN sent"
                 )));
             }
-            let continuing = stored.is_err() || progress(done, expected);
+            let continuing = stored.is_err() || status & 0x10 != 0 || progress(done, expected);
             let cancelled = cancel.load(Ordering::Relaxed);
             let stopped = cancelled || !continuing || status & 0x10 != 0;
             let expired = Instant::now() >= deadline;

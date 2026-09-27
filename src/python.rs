@@ -90,6 +90,7 @@ struct Options {
     ir_gamma: Gamma,
     thumbnail: bool,
     export_tiff: bool,
+    banding: Option<crate::scan::banding::BandingOptions>,
     film: String,
     pass_timeout: f64,
     settle_seconds: f64,
@@ -104,6 +105,7 @@ impl Default for Options {
             ir_gamma: options.ir_gamma,
             thumbnail: options.thumbnail,
             export_tiff: options.export_tiff,
+            banding: options.banding,
             film: options.film,
             pass_timeout: options.pass_timeout.as_secs_f64(),
             settle_seconds: options.settle_time.as_secs_f64(),
@@ -122,7 +124,7 @@ impl Options {
             film: self.film,
             holder_selection: None,
             measure_sharpness: false,
-            banding: None,
+            banding: self.banding,
             pass_timeout: duration(self.pass_timeout, "pass_timeout", false)?,
             settle_time: duration(self.settle_seconds, "settle_seconds", true)?,
         })
@@ -391,12 +393,170 @@ mod tests {
             let parsed: ScanSettings = from_dict(Some(&settings)).unwrap();
             assert_eq!(parsed.dpi, 600);
             assert_eq!(parsed.depth, 16);
+            assert_eq!(parsed.y_oversampling, 1);
+            settings.set_item("y_oversampling", 3).unwrap();
+            assert_eq!(
+                from_dict::<ScanSettings>(Some(&settings))
+                    .unwrap()
+                    .y_oversampling,
+                3
+            );
             settings.set_item("samples", 2).unwrap();
             assert!(from_dict::<ScanSettings>(Some(&settings)).is_err());
             let options = PyDict::new(py);
             options.set_item("exposure", 2).unwrap();
             assert!(from_dict::<Options>(Some(&options)).is_err());
             assert!(duration(f64::NAN, "timeout", false).is_err());
+        });
+    }
+
+    #[test]
+    fn banding_dictionary_uses_native_defaults_and_rejects_unknown_fields() {
+        Python::initialize();
+        Python::attach(|py| {
+            let options = PyDict::new(py);
+            for disabled in [None, Some(py.None())] {
+                if let Some(disabled) = disabled {
+                    options.set_item("banding", disabled).unwrap();
+                }
+                assert!(
+                    from_dict::<Options>(Some(&options))
+                        .unwrap()
+                        .into_scan_options()
+                        .unwrap()
+                        .banding
+                        .is_none()
+                );
+            }
+            let banding = PyDict::new(py);
+            options.set_item("banding", &banding).unwrap();
+            let parsed = from_dict::<Options>(Some(&options))
+                .unwrap()
+                .into_scan_options()
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(parsed.banding.unwrap()).unwrap(),
+                serde_json::to_value(crate::scan::banding::BandingOptions::default()).unwrap()
+            );
+            banding.set_item("strength", 0.4).unwrap();
+            banding.set_item("save_raw", true).unwrap();
+            banding
+                .set_item("detection_roi", vec![0, 64, 0, 32])
+                .unwrap();
+            let parsed = from_dict::<Options>(Some(&options))
+                .unwrap()
+                .into_scan_options()
+                .unwrap()
+                .banding
+                .unwrap();
+            assert_eq!(parsed.strength, 0.4);
+            assert!(parsed.save_raw);
+            assert_eq!(parsed.detection_roi, Some([0, 64, 0, 32]));
+            assert_eq!(parsed.max_frequencies, 3);
+            banding.set_item("misspelled_option", true).unwrap();
+            assert!(from_dict::<Options>(Some(&options)).is_err());
+            options.set_item("banding", true).unwrap();
+            assert!(from_dict::<Options>(Some(&options)).is_err());
+        });
+    }
+
+    #[test]
+    fn python_banding_preflights_scan_and_regions_before_files_or_scanner_io() {
+        Python::initialize();
+        Python::attach(|py| {
+            let (scanner, original_settings) = simulated(py);
+            let directory = tempfile::tempdir().unwrap();
+            let settings = ScanSettings::default();
+            let kwargs = PyDict::new(py);
+            kwargs
+                .set_item("settings", as_python(py, &settings).unwrap())
+                .unwrap();
+            for options in [
+                serde_json::json!({"banding": {}, "export_tiff": false}),
+                serde_json::json!({"banding": {}, "infrared_only": true}),
+                serde_json::json!({"banding": {"strength": 1.1}}),
+                serde_json::json!({"banding": {"dark_full": 0.8, "dark_off": 0.6}}),
+                serde_json::json!({"banding": {"detection_roi": [0, 10000, 0, 32]}}),
+                serde_json::json!({"banding": {"strength_typo": 0.4}}),
+            ] {
+                kwargs
+                    .set_item("options", as_python(py, &options).unwrap())
+                    .unwrap();
+                let error = scanner
+                    .bind(py)
+                    .call_method("scan", (directory.path().join("invalid"),), Some(&kwargs))
+                    .unwrap_err();
+                assert!(error.is_instance_of::<PyValueError>(py), "{error}");
+                let error = scanner
+                    .bind(py)
+                    .call_method(
+                        "scan_regions",
+                        (directory.path().join("invalid"), vec![settings.rect_mm]),
+                        Some(&kwargs),
+                    )
+                    .unwrap_err();
+                assert!(error.is_instance_of::<PyValueError>(py), "{error}");
+            }
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+            assert!(scanner.borrow(py).inner.lock().unwrap().is_open());
+            // The untouched simulated transport can still serve its original scan.
+            scanner
+                .bind(py)
+                .call_method(
+                    "scan",
+                    (directory.path().join("valid"),),
+                    Some(&region_kwargs(py, &original_settings)),
+                )
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn python_banding_preserves_three_strip_plan_for_rgb_and_gray() {
+        Python::initialize();
+        Python::attach(|py| {
+            let (scanner, _) = simulated(py);
+            let regions: Vec<_> = [2.3, 62.1, 121.5]
+                .into_iter()
+                .flat_map(|x| (0..6).map(move |row| [x, 16.5 + 38.0 * row as f64, 24.0, 36.0]))
+                .collect();
+            let kwargs = PyDict::new(py);
+            kwargs
+                .set_item(
+                    "options",
+                    as_python(py, &serde_json::json!({"banding": {}})).unwrap(),
+                )
+                .unwrap();
+            for mode in ["rgb", "gray"] {
+                kwargs
+                    .set_item(
+                        "settings",
+                        as_python(py, &serde_json::json!({"mode": mode})).unwrap(),
+                    )
+                    .unwrap();
+                let plan = scanner
+                    .bind(py)
+                    .call_method("plan_regions", (regions.clone(),), Some(&kwargs))
+                    .unwrap();
+                let batches = plan.get_item("batches").unwrap();
+                assert_eq!(batches.len().unwrap(), 3);
+                for strip in 0..3 {
+                    let batch = batches.get_item(strip).unwrap();
+                    assert_eq!(batch.get_item("region_indices").unwrap().len().unwrap(), 6);
+                    let passes = batch.get_item("plan").unwrap().get_item("passes").unwrap();
+                    assert_eq!(passes.len().unwrap(), 1);
+                    assert_eq!(
+                        passes
+                            .get_item(0)
+                            .unwrap()
+                            .get_item("kind")
+                            .unwrap()
+                            .extract::<String>()
+                            .unwrap(),
+                        mode
+                    );
+                }
+            }
         });
     }
 

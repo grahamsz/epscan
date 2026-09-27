@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: MIT
 //! Exclusive connection lifecycle and Epson command execution.
 pub mod esci;
 pub mod image;
@@ -27,6 +27,7 @@ pub struct Session {
 }
 impl Session {
     pub fn open(device: Device, timeout: Duration) -> Result<Self> {
+        crate::capabilities::require_native_protocol(device.vid, device.pid)?;
         let transport = transport::open(&device)?;
         Self::with_transport(device, transport, timeout)
     }
@@ -35,6 +36,7 @@ impl Session {
         transport: Box<dyn Transport>,
         timeout: Duration,
     ) -> Result<Self> {
+        crate::capabilities::require_native_protocol(device.vid, device.pid)?;
         let usb_model = scanner_model(device.vid, device.pid).ok_or_else(|| {
             Error::NotFound(format!(
                 "Unsupported USB scanner {:04x}:{:04x}",

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: MIT
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("device not found: {0}")]
@@ -29,5 +29,15 @@ pub fn unsupported(feature: impl Into<String>, reason: impl Into<String>) -> Err
     Error::Unsupported {
         feature: feature.into(),
         reason: reason.into(),
+    }
+}
+
+impl From<negative_banding::Error> for Error {
+    fn from(error: negative_banding::Error) -> Self {
+        match error {
+            negative_banding::Error::Invalid(message) => Self::Invalid(message),
+            negative_banding::Error::Cancelled => Self::Cancelled,
+            negative_banding::Error::Io(error) => Self::Io(error),
+        }
     }
 }

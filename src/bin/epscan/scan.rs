@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: MIT
 use super::{
     cancel,
     cli::{Capture, Preview, Scan},
@@ -27,6 +27,7 @@ pub fn scan(args: Scan, backend: Backend, timeout: Duration) -> Result<()> {
     let settings = ScanSettings {
         mode: args.capture.mode,
         dpi: args.dpi,
+        y_oversampling: args.y_oversampling,
         depth: args.depth,
         gamma: args.gamma,
         preview: false,
@@ -39,7 +40,7 @@ pub fn scan(args: Scan, backend: Backend, timeout: Duration) -> Result<()> {
         thumbnail: args.thumbnail,
         export_tiff: !args.capture.raw_only,
         banding: args.capture.banding_options()?,
-        film: args.capture.film.name().into(),
+        film: args.capture.film_name().into(),
         measure_sharpness: args.capture.measure_sharpness,
         pass_timeout: Duration::from_secs(args.capture.scan_timeout),
         settle_time: Duration::from_secs(args.settle_seconds),
@@ -63,7 +64,7 @@ pub fn preview(args: Preview, backend: Backend, timeout: Duration) -> Result<()>
     let options = ScanOptions {
         export_tiff: !args.capture.raw_only,
         banding: args.capture.banding_options()?,
-        film: args.capture.film.name().into(),
+        film: args.capture.film_name().into(),
         measure_sharpness: args.capture.measure_sharpness,
         pass_timeout: Duration::from_secs(args.capture.scan_timeout),
         ..ScanOptions::default()

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: MIT
 //! ESC/I wire data defined by docs/protocol.md and checked against device traces.
 //! Protocol facts were researched using SANE; this module is original Rust code.
 pub use crate::capabilities::{OpticsProfile, ScanMode, Source};
@@ -100,6 +100,8 @@ pub enum Gamma {
 pub struct ScanSettings {
     pub rect_mm: [f64; 4],
     pub dpi: u32,
+    /// Acquire this many carriage-axis rows per square output row, then average.
+    pub y_oversampling: u32,
     pub depth: u8,
     pub mode: ScanMode,
     pub source: Source,
@@ -111,6 +113,7 @@ impl Default for ScanSettings {
         Self {
             rect_mm: [0., 0., 10., 10.],
             dpi: 300,
+            y_oversampling: 1,
             depth: 16,
             mode: ScanMode::default(),
             source: Source::Transparency,
@@ -128,6 +131,27 @@ impl ScanSettings {
 
     pub fn pixels_for(&self, model: &ScannerModel) -> Result<[u32; 4]> {
         pixel_rectangle(self.rect_mm, self.dpi, model.transfer.width_alignment)
+    }
+
+    pub fn acquisition_y_dpi(&self) -> Result<u32> {
+        if !(1..=16).contains(&self.y_oversampling) {
+            return Err(Error::Invalid("Y oversampling must be in 1..=16".into()));
+        }
+        self.dpi
+            .checked_mul(self.y_oversampling)
+            .ok_or_else(|| Error::Invalid("Y acquisition DPI overflow".into()))
+    }
+
+    /// Wire coordinates preserve the exact square output pixel boundaries.
+    pub fn acquisition_pixels_for(&self, model: &ScannerModel) -> Result<[u32; 4]> {
+        self.acquisition_y_dpi()?;
+        let mut pixels = self.pixels_for(model)?;
+        for index in [1, 3] {
+            pixels[index] = pixels[index]
+                .checked_mul(self.y_oversampling)
+                .ok_or_else(|| Error::Invalid("Y acquisition geometry overflow".into()))?;
+        }
+        Ok(pixels)
     }
 
     pub fn validate(&self, caps: &Capabilities, ir: bool) -> Result<()> {
@@ -160,6 +184,14 @@ impl ScanSettings {
                 "DPI outside supported range {minimum}..={maximum}"
             )));
         }
+        let y_dpi = self.acquisition_y_dpi()?;
+        let max_y_dpi = maximum.min(source.max_y_dpi);
+        if self.y_oversampling > 1 && y_dpi > max_y_dpi {
+            return Err(Error::Invalid(format!(
+                "Y oversampling requires {y_dpi} DPI, above the scanner's {max_y_dpi} DPI carriage sampling limit"
+            )));
+        }
+        let wire_pixels = self.acquisition_pixels_for(model)?;
         let [max_x, max_y] = caps.area_mm(self.source);
         if !max_x.is_finite() || !max_y.is_finite() || max_x <= 0. || max_y <= 0. {
             return Err(unsupported(
@@ -171,11 +203,13 @@ impl ScanSettings {
         // Check the requested physical area and the independently rounded wire
         // endpoints. Rounding x and width separately can add one column at an edge.
         let bounds = [max_x, max_y].map(|value| (value * f64::from(self.dpi) / 25.4 + 0.5).floor());
+        let wire_y_bound = (max_y * f64::from(y_dpi) / 25.4 + 0.5).floor();
         if x + w > max_x + 1e-6
             || y + h > max_y + 1e-6
             || f64::from(pixels[0]) + f64::from(pixels[2]) > bounds[0]
             || f64::from(pixels[1]) + f64::from(pixels[3]) > bounds[1]
             || pixels[2] > caps.max_width_pixels
+            || f64::from(wire_pixels[1]) + f64::from(wire_pixels[3]) > wire_y_bound
         {
             return Err(Error::Invalid(format!(
                 "Rectangle exceeds source area {max_x} x {max_y} mm"
@@ -206,11 +240,15 @@ impl ScanSettings {
         if ![8, 16].contains(&self.depth) {
             return Err(Error::Invalid("Depth must be 8 or 16".into()));
         }
-        let rectangle = self.pixels_for(model)?;
+        let rectangle = self.acquisition_pixels_for(model)?;
         let source = model.source(self.source)?;
         let mode = model.mode_for(self.mode, ir)?;
         let mut packet = ParameterPacket::default();
-        packet.words([self.dpi, self.dpi].into_iter().chain(rectangle));
+        packet.words(
+            [self.dpi, self.acquisition_y_dpi()?]
+                .into_iter()
+                .chain(rectangle),
+        );
         let option = if ir {
             source
                 .infrared_option
@@ -499,6 +537,64 @@ mod tests {
         let mut caps = caps();
         caps.transparency_8x10_pixels = [0, 0];
         assert!(guide.validate(&caps, false).is_err());
+    }
+
+    #[test]
+    fn y_oversampling_encodes_asymmetric_wire_coordinates_and_enforces_hardware_limit() {
+        let mut caps = caps();
+        let mut settings = ScanSettings {
+            dpi: 3200,
+            y_oversampling: 3,
+            rect_mm: [1.25, 3.37, 2.0, 4.0],
+            ..Default::default()
+        };
+        let square = settings.pixels().unwrap();
+        let packet = settings.parameters_with_capabilities(&caps, false).unwrap();
+        let words: Vec<_> = packet[..24]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| u32::from_le_bytes(*bytes))
+            .collect();
+        assert_eq!(
+            words,
+            [
+                3200,
+                9600,
+                square[0],
+                square[1] * 3,
+                square[2],
+                square[3] * 3
+            ]
+        );
+        settings.y_oversampling = 4;
+        assert!(
+            settings
+                .validate(&caps, false)
+                .unwrap_err()
+                .to_string()
+                .contains("9600")
+        );
+        settings.y_oversampling = 3;
+        caps.max_dpi = 6400;
+        assert!(
+            settings
+                .validate(&caps, false)
+                .unwrap_err()
+                .to_string()
+                .contains("6400")
+        );
+        caps.max_dpi = 12800;
+        settings.y_oversampling = 1;
+        settings.dpi = 12800;
+        assert!(settings.validate(&caps, false).is_ok());
+        for factor in [0, 17, u32::MAX] {
+            settings.y_oversampling = factor;
+            assert!(settings.validate(&caps, false).is_err());
+        }
+        settings.dpi = u32::MAX;
+        settings.y_oversampling = 2;
+        assert!(settings.acquisition_y_dpi().is_err());
     }
 
     #[test]

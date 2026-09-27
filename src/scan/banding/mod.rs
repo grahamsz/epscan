@@ -1,14 +1,14 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: MIT
 //! Optional correction of coherent vertical bands in uninverted negative samples.
 //! The original packed acquisition stays immutable. TIFFs are streamed in strips;
 //! fitting retains only disjoint sets of at most 768 full-width source rows.
 
-mod model;
+use negative_banding as core;
 #[cfg(test)]
 mod tests;
 
 use crate::{Error, Result, session::image::ImageResult};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom},
@@ -18,7 +18,8 @@ use std::{
 
 /// The accepted experimental negative-film preset. Brightness is original
 /// sample/full-scale, with a common maximum-channel mask for RGB.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct BandingOptions {
     pub strength: f64,
     pub dark_full: f64,
@@ -37,7 +38,7 @@ pub struct BandingOptions {
 impl Default for BandingOptions {
     fn default() -> Self {
         Self {
-            strength: 0.8,
+            strength: 1.0,
             dark_full: 0.1,
             dark_off: 0.6,
             max_frequencies: 3,
@@ -53,6 +54,22 @@ impl Default for BandingOptions {
 }
 
 impl BandingOptions {
+    fn core_options(&self) -> core::BandingOptions {
+        core::BandingOptions {
+            strength: self.strength,
+            dark_full: self.dark_full,
+            dark_off: self.dark_off,
+            max_frequencies: self.max_frequencies,
+            min_period: self.min_period,
+            max_period: self.max_period,
+            window_cycles: self.window_cycles,
+            grid_y: self.grid_y,
+            detection_roi: self.detection_roi,
+            save_raw: self.save_raw,
+            save_signal: self.save_signal,
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         if !self.strength.is_finite() || !(0.0..=1.0).contains(&self.strength) {
             return Err(Error::Invalid(
@@ -159,13 +176,7 @@ fn check_cancel(cancel: &AtomicBool) -> Result<()> {
     }
 }
 
-fn sample_rows(height: usize) -> (Vec<usize>, Vec<usize>) {
-    let stride = 2 * height.div_ceil(2 * 768).max(1);
-    (
-        (0..height).step_by(stride).collect(),
-        (stride / 2..height).step_by(stride).collect(),
-    )
-}
+use core::sample_rows;
 
 fn packed_shape(image: &ImageResult) -> Result<(usize, u64)> {
     if ![1, 3].contains(&image.channels) || ![8, 16].contains(&image.depth) || image.dpi == 0 {
@@ -195,7 +206,7 @@ fn sample_image(
     image: &ImageResult,
     row_bytes: usize,
     cancel: &AtomicBool,
-) -> Result<model::Samples> {
+) -> Result<core::Samples> {
     let mut file = File::open(&image.payload)?;
     let width = image.width as usize;
     let channels = image.channels as usize;
@@ -232,7 +243,7 @@ fn sample_image(
     };
     let training = read(&rows)?;
     let held = read(&held_rows)?;
-    Ok(model::Samples {
+    Ok(core::Samples {
         width,
         height: image.height as usize,
         channels,
@@ -244,24 +255,77 @@ fn sample_image(
     })
 }
 
-/// Analyze the captured payload, then export a separate corrected TIFF and
-/// optional unchanged TIFF and signed applied-signal PNG. Existing files are
-/// never replaced. Failed exports clean up only files created by this call.
-pub fn export(
-    image: &mut ImageResult,
-    final_path: &Path,
-    options: &BandingOptions,
-    cancel: &AtomicBool,
-) -> Result<()> {
-    check_cancel(cancel)?;
-    options.validate_shape(image.width, image.height)?;
-    let (row_bytes, expected) = packed_shape(image)?;
-    let source = image.payload.metadata()?;
-    if !source.is_file() || source.len() != expected {
-        return Err(Error::Protocol(
-            "Banding payload size does not match packed row stride".into(),
-        ));
+/// A fit retained after one completed acquisition so all derived frames use
+/// the same source-coordinate correction field.
+pub(crate) struct PreparedBanding {
+    fitted: core::Analysis,
+    options: BandingOptions,
+    source_payload: PathBuf,
+    source_sha256: serde_json::Value,
+    channels: u8,
+    depth: u8,
+    dpi: u32,
+}
+
+impl PreparedBanding {
+    pub(crate) fn prepare(
+        image: &ImageResult,
+        options: &BandingOptions,
+        cancel: &AtomicBool,
+    ) -> Result<Self> {
+        check_cancel(cancel)?;
+        options.validate_shape(image.width, image.height)?;
+        let (row_bytes, expected) = packed_shape(image)?;
+        let source = image.payload.metadata()?;
+        if !source.is_file() || source.len() != expected {
+            return Err(Error::Protocol(
+                "Banding payload size does not match packed row stride".into(),
+            ));
+        }
+        let samples = sample_image(image, row_bytes, cancel)?;
+        let config = core::Config {
+            width: image.width as usize,
+            height: image.height as usize,
+            channels: image.channels as usize,
+            options: options.core_options(),
+            carrier_boost: 1.5,
+            compact_opacity: 1.0,
+        };
+        let fitted = core::analyze_samples(samples, config, cancel)?;
+        Ok(Self {
+            fitted,
+            options: options.clone(),
+            source_payload: image.payload.clone(),
+            source_sha256: image.metadata["sha256"].clone(),
+            channels: image.channels,
+            depth: image.depth,
+            dpi: image.dpi,
+        })
     }
+
+    pub(crate) fn matches_source(&self, image: &ImageResult, options: &BandingOptions) -> bool {
+        self.source_payload == image.payload
+            && self.source_sha256 == image.metadata["sha256"]
+            && self.fitted.config.width == image.width as usize
+            && self.fitted.config.height == image.height as usize
+            && self.channels == image.channels
+            && self.depth == image.depth
+            && self.dpi == image.dpi
+            && self.options == *options
+    }
+
+    pub(crate) fn export_crop(
+        &self,
+        image: &mut ImageResult,
+        origin: [u32; 2],
+        final_path: &Path,
+        cancel: &AtomicBool,
+    ) -> Result<()> {
+        export_prepared(image, final_path, self, origin, true, cancel)
+    }
+}
+
+fn check_output_paths(final_path: &Path, options: &BandingOptions) -> Result<Vec<PathBuf>> {
     let paths = artifact_paths(final_path, options);
     for path in &paths {
         match path.symlink_metadata() {
@@ -285,24 +349,84 @@ pub fn export(
             )));
         }
     }
-    let samples = sample_image(image, row_bytes, cancel)?;
-    let fitted = model::analyze(&samples, options, cancel)?;
-    drop(samples);
+    Ok(paths)
+}
+
+/// Analyze the captured payload, then export a separate corrected TIFF and
+/// optional unchanged TIFF and signed applied-signal PNG. Existing files are
+/// never replaced. Failed exports clean up only files created by this call.
+pub fn export(
+    image: &mut ImageResult,
+    final_path: &Path,
+    options: &BandingOptions,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    check_cancel(cancel)?;
+    check_output_paths(final_path, options)?;
+    let prepared = PreparedBanding::prepare(image, options, cancel)?;
+    export_prepared(image, final_path, &prepared, [0, 0], false, cancel)
+}
+
+fn export_prepared(
+    image: &mut ImageResult,
+    final_path: &Path,
+    prepared: &PreparedBanding,
+    origin: [u32; 2],
+    shared_capture: bool,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    check_cancel(cancel)?;
+    let options = &prepared.options;
+    let fitted = &prepared.fitted;
+    if image.channels != prepared.channels
+        || image.depth != prepared.depth
+        || image.dpi != prepared.dpi
+        || origin[0]
+            .checked_add(image.width)
+            .is_none_or(|end| end as usize > fitted.config.width)
+        || origin[1]
+            .checked_add(image.height)
+            .is_none_or(|end| end as usize > fitted.config.height)
+    {
+        return Err(Error::Invalid(
+            "Banding crop does not match the fitted source image".into(),
+        ));
+    }
+    let (row_bytes, expected) = packed_shape(image)?;
+    let source = image.payload.metadata()?;
+    if !source.is_file() || source.len() != expected {
+        return Err(Error::Protocol(
+            "Banding payload size does not match packed row stride".into(),
+        ));
+    }
+    let paths = check_output_paths(final_path, options)?;
     let preview = if options.save_signal {
-        Some(signal_preview(image, &fitted, options, row_bytes, cancel)?)
+        Some(signal_preview(
+            image, fitted, options, row_bytes, origin, cancel,
+        )?)
     } else {
         None
     };
     let mut banding = serde_json::json!({
-        "method_version": 1,
+        "method_version": 2,
         "config": options,
-        "status": if fitted.has_components() { "corrected" } else { "no_supported_frequency" },
-        "model": "multiplicative_log_gain",
+        "status": if fitted.model.has_components() { "corrected" } else { "no_supported_frequency" },
+        "model": "residual_refined_linear_sine",
         "axis": "vertical stripes; carrier varies across source columns x",
-        "diagnostics": fitted,
+        "diagnostics": fitted.model,
+        "residual_refinement": fitted.report()["residual_refinement"],
+        "shared_engine_version": core::VERSION,
+        "analysis_scope": if shared_capture { "shared_capture" } else { "output_image" },
+        "analysis_source": {
+            "payload_file": prepared.source_payload,
+            "sha256": prepared.source_sha256,
+            "width": fitted.config.width,
+            "height": fitted.config.height,
+        },
+        "crop_pixels": [origin[0], origin[1], image.width, image.height],
         "corrected_tiff_file": final_path,
         "source_payload_unchanged": true,
-        "signal_semantics": "strength * original darkness mask * fitted log-gain; corrected = raw * exp(-signal), before integer quantization/clipping"
+        "signal_semantics": "signal PNG = (raw - corrected) / full_scale; corrected = clamp(raw * (1 - strength * darkness * refined_sine_sum)), before source-depth quantization"
     });
     let mut next = 1;
     let raw_path = if options.save_raw {
@@ -326,7 +450,7 @@ pub fn export(
         ));
     }
     corrected_metadata["sample_transform"] =
-        "derived multiplicative periodic band correction; original payload unchanged".into();
+        "derived residual-refined periodic band correction; original payload unchanged".into();
     corrected_metadata["banding"] = banding.clone();
     let width = image.width as usize;
     let channels = image.channels as usize;
@@ -338,14 +462,19 @@ pub fn export(
             for (dy, row) in strip.chunks_exact_mut(row_bytes).enumerate() {
                 check_cancel(cancel)?;
                 for (channel, correction) in corrections.iter_mut().enumerate() {
-                    fitted.correction_row(channel, first_row as usize + dy, correction);
+                    fitted.correction_region_row(
+                        channel,
+                        origin[0] as usize,
+                        origin[1] as usize + first_row as usize + dy,
+                        correction,
+                    )?;
                 }
                 for x in 0..width {
                     let brightness = (0..channels)
                         .map(|channel| sample_value(row, x * channels + channel, image.depth))
                         .max()
                         .unwrap();
-                    let mask = model::dark_weight(
+                    let mask = core::dark_weight(
                         f64::from(brightness) / f64::from(max_value),
                         options.dark_full,
                         options.dark_off,
@@ -356,7 +485,7 @@ pub fn export(
                     for (channel, correction) in corrections.iter().enumerate() {
                         let offset = x * channels + channel;
                         let original = sample_value(row, offset, image.depth);
-                        let corrected = model::corrected_sample(
+                        let corrected = core::linear_corrected_sample(
                             original,
                             max_value,
                             correction[x],
@@ -403,6 +532,7 @@ struct SignalPreview {
     panel_width: u32,
     source_width: u32,
     source_height: u32,
+    model_origin: [u32; 2],
     channels: u8,
     range: f64,
     pixels: Vec<u8>,
@@ -413,10 +543,11 @@ impl SignalPreview {
         serde_json::json!({
             "width": self.width, "height": self.height, "panel_width": self.panel_width,
             "source_width": self.source_width, "source_height": self.source_height,
+            "model_origin": self.model_origin,
             "panels": if self.channels == 3 { "red, green, blue channel panels, left to right" } else { "gray channel" },
             "coordinates": "source orientation preserved; nearest samples at floor(preview_coordinate * source_extent / panel_extent)",
-            "range_log_gain": [-self.range, self.range],
-            "legend": "red = positive log signal removed (output darker); white = zero; blue = negative (output brighter)",
+            "range_fraction_full_scale": [-self.range, self.range],
+            "legend": "red = positive intensity removed (output darker); white = zero; blue = negative (output brighter)",
             "normalization": "one common symmetric range across all channel panels; max absolute preview signal"
         })
     }
@@ -452,9 +583,10 @@ fn png_error(error: png::EncodingError) -> Error {
 
 fn signal_preview(
     image: &ImageResult,
-    fitted: &model::Model,
+    fitted: &core::Analysis,
     options: &BandingOptions,
     row_bytes: usize,
+    origin: [u32; 2],
     cancel: &AtomicBool,
 ) -> Result<SignalPreview> {
     let source_width = image.width as usize;
@@ -480,14 +612,18 @@ fn signal_preview(
                 .map(|channel| sample_value(&packed, x * channels + channel, image.depth))
                 .max()
                 .unwrap();
-            let mask = model::dark_weight(
+            let mask = core::dark_weight(
                 f64::from(brightness) / max_value,
                 options.dark_full,
                 options.dark_off,
             );
             for channel in 0..channels {
-                values[py * width + channel * panel_width + px] =
-                    options.strength * mask * fitted.correction(channel, x, y);
+                let raw = f64::from(sample_value(&packed, x * channels + channel, image.depth))
+                    / max_value;
+                let signal =
+                    fitted.correction(channel, origin[0] as usize + x, origin[1] as usize + y)?;
+                let corrected = (raw * (1.0 - options.strength * mask * signal)).clamp(0.0, 1.0);
+                values[py * width + channel * panel_width + px] = raw - corrected;
             }
         }
     }
@@ -512,6 +648,7 @@ fn signal_preview(
         panel_width: panel_width as u32,
         source_width: image.width,
         source_height: image.height,
+        model_origin: origin,
         channels: image.channels,
         range,
         pixels,

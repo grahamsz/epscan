@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "epscan"
 description = "Direct Epson ESC/I scanner acquisition"
 readme = "README.md"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 dynamic = ["version"]
 requires-python = ">=3.13"
 classifiers = [

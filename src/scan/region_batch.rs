@@ -1,10 +1,11 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: MIT
 //! Shared acquisitions and exact extraction for explicitly placed crop regions.
 use super::{
     Progress, ScanOptions, ScanPlan, ScanResult,
-    crop::{FrameExtraction, extract_frame},
+    crop::{FrameExtraction, PreparedFrameBanding, extract_frame_with_banding},
     io::suffix,
     regions::{RegionScanPlan, plan_region_batches},
+    stream::{self, StreamBatch},
 };
 use crate::{Capabilities, Error, Result, ScanSettings, Session};
 use std::{
@@ -13,12 +14,14 @@ use std::{
 };
 
 impl Session {
-    /// Scan nearby regions together, then extract each region without resampling.
+    /// Scan nearby regions together and export completed frames without resampling.
     ///
     /// Results retain input order. `region_done` receives the original zero-based
     /// index as each output completes; false cancels. Completed files are retained
     /// on failure. Progress follows global acquisition bytes, with `pass`
     /// identifying the acquisition, and reaches 100% after all output callbacks.
+    /// Grouped visible scans acquire on a worker while the caller exports ready
+    /// frames and runs callbacks. Banding waits for the strip and reuses its fit.
     #[allow(clippy::too_many_arguments)]
     pub fn scan_regions(
         &mut self,
@@ -34,7 +37,7 @@ impl Session {
         self.protocol()?;
         let caps = self.capabilities.clone();
         let plan = plan_region_batches(regions, settings, options, &caps, max_gap_mm)?;
-        let outcome = execute_regions(
+        let outcome = execute_with_capture(
             regions,
             settings,
             options,
@@ -44,9 +47,7 @@ impl Session {
             cancel,
             progress,
             region_done,
-            &mut |settings, options, basename, progress| {
-                self.scan(settings, options, basename, cancel, progress)
-            },
+            self,
         );
         if outcome.is_err() {
             self.close();
@@ -129,6 +130,7 @@ impl BatchProgress<'_> {
     }
 }
 
+#[cfg(test)]
 type Capture<'a> = dyn FnMut(
         &ScanSettings,
         &ScanOptions,
@@ -137,6 +139,51 @@ type Capture<'a> = dyn FnMut(
     ) -> Result<ScanResult>
     + 'a;
 
+trait RegionCapture {
+    fn capture(
+        &mut self,
+        settings: &ScanSettings,
+        options: &ScanOptions,
+        basename: &Path,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(Progress<'_>) -> bool,
+    ) -> Result<ScanResult>;
+
+    fn stream(
+        &mut self,
+        _batch: &StreamBatch<'_>,
+        _cancel: &AtomicBool,
+        _progress: &mut dyn FnMut(Progress<'_>) -> bool,
+        _region_done: &mut dyn FnMut(usize, &ScanResult) -> Result<bool>,
+    ) -> Option<Result<Vec<(usize, ScanResult)>>> {
+        None
+    }
+}
+
+impl RegionCapture for Session {
+    fn capture(
+        &mut self,
+        settings: &ScanSettings,
+        options: &ScanOptions,
+        basename: &Path,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(Progress<'_>) -> bool,
+    ) -> Result<ScanResult> {
+        self.scan(settings, options, basename, cancel, progress)
+    }
+
+    fn stream(
+        &mut self,
+        batch: &StreamBatch<'_>,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(Progress<'_>) -> bool,
+        region_done: &mut dyn FnMut(usize, &ScanResult) -> Result<bool>,
+    ) -> Option<Result<Vec<(usize, ScanResult)>>> {
+        Some(stream::capture(self, batch, cancel, progress, region_done))
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn execute_regions(
     regions: &[[f64; 4]],
@@ -149,6 +196,46 @@ fn execute_regions(
     progress: &mut dyn FnMut(Progress<'_>) -> bool,
     region_done: &mut dyn FnMut(usize, &ScanResult) -> Result<bool>,
     capture: &mut Capture<'_>,
+) -> Result<Vec<ScanResult>> {
+    struct FixtureCapture<'a, 'b>(&'a mut Capture<'b>);
+    impl RegionCapture for FixtureCapture<'_, '_> {
+        fn capture(
+            &mut self,
+            settings: &ScanSettings,
+            options: &ScanOptions,
+            basename: &Path,
+            _cancel: &AtomicBool,
+            progress: &mut dyn FnMut(Progress<'_>) -> bool,
+        ) -> Result<ScanResult> {
+            (self.0)(settings, options, basename, progress)
+        }
+    }
+    execute_with_capture(
+        regions,
+        settings,
+        options,
+        basename,
+        caps,
+        plan,
+        cancel,
+        progress,
+        region_done,
+        &mut FixtureCapture(capture),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_with_capture(
+    regions: &[[f64; 4]],
+    settings: &ScanSettings,
+    options: &ScanOptions,
+    basename: &Path,
+    caps: &Capabilities,
+    plan: &RegionScanPlan,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(Progress<'_>) -> bool,
+    region_done: &mut dyn FnMut(usize, &ScanResult) -> Result<bool>,
+    capture: &mut dyn RegionCapture,
 ) -> Result<Vec<ScanResult>> {
     let mut total = 0u64;
     for batch in &plan.batches {
@@ -193,10 +280,54 @@ fn execute_regions(
         } else {
             target_name(batch.region_indices[0])
         };
-        let source = capture(
+        let targets: Vec<_> = batch
+            .region_indices
+            .iter()
+            .map(|&index| {
+                (
+                    index,
+                    FrameExtraction {
+                        settings: ScanSettings {
+                            rect_mm: regions[index],
+                            ..settings.clone()
+                        },
+                        options: options.clone(),
+                        basename: target_name(index),
+                    },
+                )
+            })
+            .collect();
+        if grouped
+            && options.banding.is_none()
+            && let Some(streamed) = capture.stream(
+                &StreamBatch {
+                    settings: &batch.settings,
+                    options: &capture_options,
+                    basename: &capture_name,
+                    plan: &batch.plan,
+                    targets: &targets,
+                    caps,
+                },
+                cancel,
+                &mut |update| progress.report(update, &batch.plan),
+                region_done,
+            )
+        {
+            for (index, result) in streamed? {
+                results[index] = Some(result);
+            }
+            progress.completed += plan_bytes(&batch.plan)?;
+            progress.finish_batch()?;
+            if cancel.load(Ordering::Relaxed) {
+                return Err(Error::Cancelled);
+            }
+            continue;
+        }
+        let source = capture.capture(
             &batch.settings,
             &capture_options,
             &capture_name,
+            cancel,
             &mut |update| progress.report(update, &batch.plan),
         )?;
         progress.completed += plan_bytes(&batch.plan)?;
@@ -204,19 +335,27 @@ fn execute_regions(
             return Err(Error::Cancelled);
         }
         if grouped {
-            for &index in &batch.region_indices {
-                let target = FrameExtraction {
-                    settings: ScanSettings {
-                        rect_mm: regions[index],
-                        ..settings.clone()
-                    },
-                    options: options.clone(),
-                    basename: target_name(index),
-                };
-                let result =
-                    extract_frame(&source, &batch.plan, &target, caps, cancel, &mut |update| {
-                        progress.hold(update)
-                    })?;
+            if options.banding.is_some()
+                && !progress.hold(Progress {
+                    phase: "banding",
+                    pass: 0,
+                    done: 0,
+                    total: 0,
+                })
+            {
+                return Err(Error::Cancelled);
+            }
+            let banding = PreparedFrameBanding::prepare(&source, &batch.plan, options, cancel)?;
+            for (index, target) in targets {
+                let result = extract_frame_with_banding(
+                    &source,
+                    &batch.plan,
+                    &target,
+                    caps,
+                    cancel,
+                    &mut |update| progress.hold(update),
+                    banding.as_ref(),
+                )?;
                 if !region_done(index, &result)? || cancel.load(Ordering::Relaxed) {
                     return Err(Error::Cancelled);
                 }

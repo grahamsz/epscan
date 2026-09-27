@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: MIT
 use super::{finish, finish_source};
 use epscan::{ScanResult, session::image::ImageResult};
 use serde_json::{Value, json};

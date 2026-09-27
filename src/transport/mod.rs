@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: MIT
 //! Operating-system USB byte I/O; no Epson commands.
 pub use crate::device::{Backend, Device, nusb_location};
 use crate::{Error, Result};

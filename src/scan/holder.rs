@@ -1,7 +1,10 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: MIT
 //! Pure planning for one acquisition of selected frames on a continuous strip.
 use super::{HolderSelection, PassKind, PlannedPass, ScanPlan};
-use crate::{Capabilities, Error, Result, ScanSettings, capabilities::Holder};
+use crate::{
+    Capabilities, Error, Result, ScanSettings,
+    capabilities::{FrameFormat, Holder},
+};
 use serde::Serialize;
 
 /// One independently validated frame, before continuous-strip grouping.
@@ -24,6 +27,7 @@ pub struct HolderBatchPlan {
 
 struct Group {
     holder: Holder,
+    frame_format: Option<FrameFormat>,
     strip: Option<u32>,
     parameter_key: Option<[u8; 64]>,
     frame_indices: Vec<usize>,
@@ -43,7 +47,10 @@ pub fn plan_holder_batches(
     let model = caps.scanner_model()?;
     let mut groups: Vec<Group> = Vec::new();
     for (index, frame) in frames.iter().enumerate() {
-        let layout = model.holder(frame.selection.holder)?;
+        let layout = model
+            .holder(frame.selection.holder)?
+            .for_format(frame.selection.frame_format)?;
+        let frame_format = frame.selection.frame_format.or(layout.default_format);
         let strip = layout.strip_for_frame(frame.selection.frame)?;
         if frame.plan.passes.is_empty() {
             return Err(Error::Invalid("Holder frame plan has no passes".into()));
@@ -83,6 +90,7 @@ pub fn plan_holder_batches(
         if let Some(group) = groups.iter_mut().find(|group| {
             parameter_key.is_some()
                 && group.holder == frame.selection.holder
+                && group.frame_format == frame_format
                 && group.strip == strip
                 && group.parameter_key == parameter_key
         }) {
@@ -90,6 +98,7 @@ pub fn plan_holder_batches(
         } else {
             groups.push(Group {
                 holder: frame.selection.holder,
+                frame_format,
                 strip,
                 parameter_key,
                 frame_indices: vec![index],
@@ -227,6 +236,7 @@ mod tests {
         let model = caps.scanner_model().unwrap();
         let selection = HolderSelection {
             holder: Holder::V800Film35mm,
+            frame_format: None,
             frame,
             overage_percent: overage,
         };
@@ -289,6 +299,82 @@ mod tests {
         let left_strip = &batches[1].plan.passes[0];
         assert_eq!(left_strip.pixels[1], frames[3].plan.passes[0].pixels[1]);
         assert!(left_strip.pixels[3] > frames[1].plan.passes[0].pixels[3] * 2);
+    }
+
+    #[test]
+    fn medium_and_half_frames_group_by_selected_format_and_physical_strip() {
+        let caps = capabilities();
+        let model = caps.scanner_model().unwrap();
+        for (holder, format, expected_batches) in [
+            (Holder::V800Film35mm, FrameFormat::Film35mmHalf, 3),
+            (Holder::V800MediumFormat, FrameFormat::Film6x45, 1),
+            (Holder::V800MediumFormat, FrameFormat::Film6x6, 1),
+            (Holder::V800MediumFormat, FrameFormat::Film6x17, 1),
+        ] {
+            let layout = model
+                .holder(holder)
+                .unwrap()
+                .for_format(Some(format))
+                .unwrap();
+            let frames: Vec<_> = (1..=layout.frames_mm.len() as u32)
+                .map(|frame| {
+                    let selection = HolderSelection {
+                        holder,
+                        frame_format: Some(format),
+                        frame,
+                        overage_percent: 0.0,
+                    };
+                    let settings = ScanSettings {
+                        rect_mm: layout.frame_rect(frame, 0.0).unwrap(),
+                        dpi: 1200,
+                        ..Default::default()
+                    };
+                    let options = ScanOptions {
+                        holder_selection: Some(selection),
+                        ..Default::default()
+                    };
+                    HolderFramePlan {
+                        selection,
+                        plan: options.plan(&settings, &caps).unwrap(),
+                    }
+                })
+                .collect();
+            let batches = plan_holder_batches(&frames, &caps).unwrap();
+            assert_eq!(batches.len(), expected_batches);
+            assert_exact_crops(&frames, &batches);
+        }
+        // Two presets on the same physical strip must not accidentally become
+        // one logical strip selection with inconsistent frame numbering.
+        let full = frame(1, 0.0, 300, ScanOptions::default());
+        let mut explicit_default = full.clone();
+        explicit_default.selection.frame_format = Some(FrameFormat::Film35mm);
+        assert_eq!(
+            plan_holder_batches(&[full.clone(), explicit_default], &caps)
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut half = full.clone();
+        half.selection.frame_format = Some(FrameFormat::Film35mmHalf);
+        let settings = ScanSettings {
+            rect_mm: model
+                .holder_frame_with_format(
+                    half.selection.holder,
+                    half.selection.frame_format,
+                    1,
+                    0.0,
+                )
+                .unwrap(),
+            dpi: 300,
+            ..Default::default()
+        };
+        half.plan = ScanOptions {
+            holder_selection: Some(half.selection),
+            ..Default::default()
+        }
+        .plan(&settings, &caps)
+        .unwrap();
+        assert_eq!(plan_holder_batches(&[full, half], &caps).unwrap().len(), 2);
     }
 
     #[test]

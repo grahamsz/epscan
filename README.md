@@ -4,6 +4,11 @@ Rust library, optional CLI, and Python bindings for direct Epson ESC/I USB
 acquisition. The first model profile is the Perfection V800/V850 family
 (`04b8:0151`, GT-X980/B8).
 
+V700/V750 (`04b8:012c`, GT-X900/B8) has a provisional, hardware-untested
+RGB/grayscale profile. V500, V550 and V600 are recognized by USB ID but cannot
+scan yet: they require the epkowa interpreter, not the native protocol path.
+See [model support and provenance](docs/adding-scanners.md).
+
 This is loosely inspired by the coparalbe [nkscan](https://github.com/activexray/nkscan) project but given that the
 hardware is so different a lot gets replaced.
 
@@ -18,7 +23,10 @@ epscan dump --output diagnostics.json
 epscan preview --source film-holder --rect "0,0,149,246" --basename captures/preview
 epscan scan --source film-holder --rect "10,30,40,80" --dpi 300 --depth 16 --basename captures/film
 epscan scan --source film-holder --rect "10,30,10,10;70,70,10,10" --dpi 3200 --measure-sharpness --basename captures/areas
+epscan scan --source film-holder --rect "10,30,40,80" --dpi 3200 --y-oversampling 3 --basename captures/sampled
 epscan scan --holder v800-35mm --frame "1-5,8-12" --overage 5 --dpi 3200 --basename captures/film
+epscan preview --holder v800-4x5 --frame 1 --basename captures/sheet-preview
+epscan scan --holder v800-4x5 --frame 1 --dpi 1200 --basename captures/sheet
 ```
 
 `--rect` takes one quoted argument containing `x,y,width,height` in millimetres
@@ -59,7 +67,7 @@ such as `film_1.tiff`; multiple areas use `film_area01_1.tiff`,
 `film_area02_1.tiff`, and separate sidecars. The final capture number advances
 to avoid overwriting existing files.
 
-`--holder v800-35mm` selects the measured V800-family three-strip holder and its film
+`--holder v800-35mm` selects the Epson V800/V850 35 mm Film Strip Holder and its film
 source. Frames 1–6 run down the left strip, 7–12 down the middle, and 13–18 down
 the right in the unrotated preview. `--overage 5` adds 5% to both frame dimensions,
 centered (2.5% on each edge); `--overage -10` crops each dimension by 10%,
@@ -67,7 +75,29 @@ also centered. The value must be finite and greater than -100%; the default is
 zero. Holder selection cannot be
 combined with `--rect`, and `--overage` requires holder selection. The positions
 are approximate: the holder was measured empty, so film placement may shift the
-actual images. See the [frame map and all 18 rectangles](docs/holders.md).
+actual images. `--holder v800-4x5 --frame 1` selects the Epson V800/V850
+4 x 5 inch Film Holder and its single sheet position. Its measured usable opening
+is approximately 94 × 119 mm; the holder mask covers part of the nominal sheet.
+All registered holders use the transparency source. The Epson V800/V850 Medium
+Format Film Holder is `--holder v800-medium-format`. Select its exposure preset
+with `--frame-format 6x4.5`, `6x6` (default), `6x7`, `6x8`, `6x9`, `6x12`, or
+`6x17`; the measured opening fits four, three, two, two, two, one, or one nominal
+frames respectively. The 35 mm holder also accepts `--frame-format 35mm-half`,
+with twelve 24 x 18 mm frames per strip (frames 1-12, 13-24, and 25-36).
+Omitting `--frame-format` preserves the original full-frame 35 mm layout.
+
+```powershell
+epscan preview --holder v800-medium-format --frame-format 6x6 --frame 1-3
+epscan scan --holder v800-medium-format --frame-format 6x7 --frame 1-2 --dpi 2400
+epscan scan --holder v800-35mm --frame-format 35mm-half --frame 1-12 --dpi 2400
+```
+
+Frame sizes and spacing are starting points: camera gates and loaded-film
+positions vary. The medium-format opening was measured empty, so film alignment
+has not been verified. Use NegPy's editable preview crops, `--overage` for a
+centered size change, or `--rect` for custom size and placement. Incompatible
+holder/format combinations and frame numbers are rejected before connecting.
+See the [measured holder layouts](docs/holders.md) for dimensions and numbering.
 
 `--frame` accepts individual numbers and inclusive ranges, such as `1-5,8-12`.
 Results follow the requested order; duplicate frames are included once. Every frame is
@@ -78,7 +108,7 @@ traces, including completed captures.
 Successful batches use the same cleanup policy as single scans.
 
 For single-pass RGB or grayscale scans and previews, multiple selected frames on the same
-registered strip share one acquisition. The V800 strips are frames 1–6, 7–12,
+registered strip share one acquisition. The 35 mm holder strips are frames 1–6, 7–12,
 and 13–18. Each acquisition covers the selected frames' bounding region,
 including any gaps; each output is then cropped to its own planned pixel
 rectangle with its overage applied. Samples are copied exactly, and sharpness
@@ -97,8 +127,8 @@ Negative overage can keep holder edges out of the measurement. See the
 
 Use `--reduce-banding` to reduce vertical stripes in the exported RGB or grayscale
 TIFF. It estimates repeating column variations and their strength across the
-unrotated image, then applies a multiplicative correction to dark areas of the
-negative. The defaults are **80% correction strength**, a full darkness mask below
+unrotated image, then refines signed residuals and applies a pure-sine correction to dark areas of the
+negative. The defaults are **100% fitted correction strength**, a full darkness mask below
 10% of the original sample range, and a smooth fade to zero at **60% brightness**.
 Bright pixels at or above that cutoff stay unchanged. Original orientation, DPI,
 dimensions and sample depth are retained, including 16-bit output.
@@ -112,13 +142,15 @@ With this example, `film_frame01_1.tiff` is the corrected output,
 `film_frame01_1_banding.png` visualizes the signed correction actually applied
 after the darkness mask and strength. The PNG is a reduced diagnostic preview;
 each panel preserves the image's aspect ratio, with separate R/G/B panels for
-color scans. Red indicates positive log-gain removed (samples darkened), blue
-indicates negative log-gain removed (samples brightened), and white means zero.
+color scans. Red indicates positive intensity removed (samples darkened), blue
+indicates negative intensity removed (samples brightened), and white means zero.
+The fitter is shared with Photoshop in `crates/negative-banding`; TIFFs retain
+full source precision. See [current method](docs/banding-correction.md).
 JSON metadata records the
 configuration, detected bands and output paths. Optional exports must finish
 successfully before the CLI removes intermediate raw `.bin` payloads.
 
-Tune `--banding-strength 0.8`, `--banding-dark-full 0.1`, and
+Tune `--banding-strength 1.0`, `--banding-dark-full 0.1`, and
 `--banding-dark-off 0.6` as fractions from 0 to 1; the full-mask threshold must
 be below the cutoff. `--banding-roi "X0,X1,Y0,Y1"` restricts frequency detection
 to a half-open region in original output pixels, useful for choosing a smooth
@@ -251,3 +283,17 @@ confirmed readiness and permits one further start; cold and warm scans passed
 with the rebuilt CLI. See the [investigation and test results](docs/hardware-debug-2026-09-25.md)
 and [hardware coverage](docs/hardware-validation.md). Protocol research and
 acknowledgements are recorded in [the sources](docs/sources.md) and [NOTICE](NOTICE.md).
+
+## Binary releases
+
+Download CLI archives from [GitHub Releases](https://github.com/grahamsz/epscan/releases).
+Windows x64, Linux x64 (Ubuntu 22.04 or newer), and macOS Intel/Apple Silicon
+archives include the executable and license notices. macOS builds are unsigned.
+Checksums are supplied in `SHA256SUMS.txt`.
+
+Maintainers: update the package version and `.github/release-notes.md`, commit,
+and push a matching `vX.Y.Z` tag. The binary workflow runs CI and publishes the
+release only after checks and all four builds pass. Manual runs produce Actions
+artifacts; a manual run on a version tag also publishes the release.
+
+License: [MIT](LICENSE-MIT). See [NOTICE](NOTICE.md) for attribution.

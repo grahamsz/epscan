@@ -4,7 +4,7 @@ This repository began as a clone of [activexray/nkscan](https://github.com/activ
 by Kira Shila and contributors, under MIT OR Apache-2.0. Its layered library
 organization and CLI conventions informed this conversion. The Nikon scanner
 implementation, SCSI/FireWire tooling, vendor ICC profiles, and Nikon protocol
-documents have been removed. The original license files are retained.
+documents have been removed. Epscan uses the MIT option of that license; the original MIT license and attribution are retained.
 
 The CLI retains the original fork's progress coordinator unchanged, along with
 its pass-bar formatting, tracing setup and generic cancellation UI. Small

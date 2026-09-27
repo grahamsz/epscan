@@ -1,22 +1,80 @@
-name: Build binaries
+name: Build binaries and release
 on:
+  push:
+    tags: ['v*']
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
   build:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --locked --features cli --bin epscan
+      - name: Build and smoke test
+        shell: bash
+        run: |
+          cargo build --release --locked --features cli --bin epscan --target ${{ matrix.target }}
+          target/${{ matrix.target }}/release/epscan --version
+      - name: Package
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $package = "epscan-$env:REF_NAME-$env:TARGET"
+          New-Item -ItemType Directory -Path $package | Out-Null
+          $binary = if ($IsWindows) { 'epscan.exe' } else { 'epscan' }
+          Copy-Item "target/$env:TARGET/release/$binary" $package
+          Copy-Item README.md, LICENSE-MIT, NOTICE.md $package
+          if ($IsWindows) {
+            Compress-Archive -Path $package -DestinationPath "$package.zip"
+          } else {
+            tar -czf "$package.tar.gz" $package
+            if ($LASTEXITCODE -ne 0) { throw 'Archive failed' }
+          }
       - uses: actions/upload-artifact@v4
         with:
-          name: epscan-${{ matrix.os }}
+          name: epscan-${{ matrix.target }}
           path: |
-            target/release/epscan
-            target/release/epscan.exe
+            epscan-*.zip
+            epscan-*.tar.gz
+          if-no-files-found: error
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [checks, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: epscan-*
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          test "$RELEASE_TAG" = "v$version"
+          (cd dist && sha256sum *.zip *.tar.gz > SHA256SUMS.txt)
+          gh release create "$RELEASE_TAG" dist/* --verify-tag --title "epscan $version" --notes-file .github/release-notes.md

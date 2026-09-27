@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: MIT
 //! Shared-phase vertical band detection and spatial log-gain fitting.
 //!
 //! Coordinates always refer to source columns/rows; detection crops only move
@@ -16,7 +16,7 @@ use serde::Serialize;
 use super::BandingOptions;
 use crate::error::{Error, Result};
 
-pub(super) struct Samples {
+pub struct Samples {
     pub width: usize,
     pub height: usize,
     pub channels: usize,
@@ -29,7 +29,7 @@ pub(super) struct Samples {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(super) struct Frequency {
+pub struct Frequency {
     pub frequency: f64,
     pub period_px: f64,
     pub amplitude: f64,
@@ -42,7 +42,7 @@ pub(super) struct Frequency {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(super) struct Validation {
+pub struct Validation {
     pub period_px: f64,
     pub before: f64,
     pub after: f64,
@@ -55,7 +55,7 @@ pub(super) struct Validation {
 }
 
 #[derive(Debug, Default, Serialize)]
-pub(super) struct ChannelModel {
+pub struct ChannelModel {
     pub frequencies: Vec<Frequency>,
     pub x: Vec<f64>,
     pub y: Vec<f64>,
@@ -73,7 +73,7 @@ pub(super) struct ChannelModel {
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct Model {
+pub struct Model {
     pub width: usize,
     pub height: usize,
     pub max_value: f64,
@@ -150,7 +150,7 @@ impl ChannelModel {
     }
 }
 
-pub(super) fn dark_weight(brightness: f64, full: f64, off: f64) -> f64 {
+pub fn dark_weight(brightness: f64, full: f64, off: f64) -> f64 {
     let t = ((brightness - full) / (off - full)).clamp(0.0, 1.0);
     (1.0 - t * t * t * (10.0 - 15.0 * t + 6.0 * t * t)).clamp(0.0, 1.0)
 }

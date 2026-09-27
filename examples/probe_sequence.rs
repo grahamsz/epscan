@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: MIT
 //! One explicit, bounded ESC/I sequence experiment. Build with `--features cli`.
 //! Every invocation performs at most one acquisition, without recovery or retries.
 
@@ -278,6 +278,7 @@ mod experiment {
             },
             rect_mm: [0., 0., args.width_mm, args.height_mm],
             dpi: args.dpi,
+            y_oversampling: 1,
             depth: args.depth,
             source: Source::Transparency,
             gamma: args.gamma,

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: MIT
 use super::{Transport, nusb_location};
 use crate::{Error, Result, capabilities::scanner_model};
 use nusb::{

@@ -62,6 +62,41 @@ Additional primary references:
   installed SDK usbscan.h, and the installed Epson driver's INF.
 - [Epson V800/V850 user guide](https://files.support.epson.com/docid/cpd4/cpd41530.pdf)
   for placement and infrared film restrictions.
+- [Epson's 4 × 5 inch film placement guide](https://files.support.epson.com/docid/cpd4/cpd41530/source/scanners/source/placing_originals/tasks/placing_45_film_pv800_v850.html),
+  consulted 2026-09-26, for the official holder name and placement. The registered
+  `v800-4x5` rectangle comes from a local loaded-holder 300-DPI RGB8 preview on
+  that date, not dimensions inferred from the guide; see [holder measurements](holders.md).
 - [Epson V800 specifications](https://download4.epson.biz/sec_pubs/epson_perfection_v800_photo/useg/en/html/specs_2.htm)
   for optical versus output DPI. Optical-path interpretation remains an inference;
   a focus acknowledgement is not proof of physical lens selection.
+- [Epson V800 hardware-resolution specifications](https://epson.com/For-Work/Scanners/Photo-and-Graphics/Epson-Perfection-V800-Photo-Color-Scanner/p/B11B223201),
+  consulted 2026-09-26: 4800 x 9600 and 6400 x 9600 DPI hardware resolutions,
+  compared with 12800 x 12800 maximum output resolution. These establish the
+  model's 9600 DPI carriage-axis oversampling cap; identity limits can lower it.
+  Extra carriage samples are averaged, not assumed to provide calibrated
+  independent exposures or a measured noise improvement.
+- [Epson medium-format placement guide](https://files.support.epson.com/docid/cpd4/cpd41530/source/scanners/source/placing_originals/tasks/placing_medium_film_pv800_v850.html)
+  and [Epson V800 product specifications](https://epson.com/For-Work/Scanners/Photo-and-Graphics/Epson-Perfection-V800-Photo-Color-Scanner/p/B11B223201),
+  consulted 2026-09-26, for the official medium-format holder and its 6 x 20 cm
+  maximum film size. The registered opening comes from a local empty-holder
+  300-DPI RGB8 preview, not from dimensions inferred from the guide. No loaded
+  medium-format film was available for exposure-registration tests.
+- [Pentax 645NII specifications](https://www.ricoh-imaging.co.jp/english/products/filmcamera/medium/645n2/spec.html),
+  consulted 2026-09-26, for the 56 x 41.5 mm image-size example used by the 6x4.5
+  starter preset. Other medium-format sizes and all nominal frame gaps are
+  editable assumptions, not claims of universal camera-gate dimensions.
+
+- Older scanner registry (consulted 2026-09-26): pinned SANE
+  [epson2 device descriptions](https://gitlab.com/sane-project/backends/-/blob/cadda80b9fec0d69728561aeae57eb8278f99c75/doc/descriptions/epson2.desc)
+  provide V500/V550/V600 USB IDs and their epkowa/non-free interpreter requirement,
+  and V700/V750 USB ID, GT-X900 identity and epson2 support classification.
+  The same revision's `backend/epson2-ops.c` groups GT-X900 with GT-X980 for
+  secondary transparency-source and transfer handling. These are protocol
+  references, not local V700 hardware verification.
+- [Epson V700 specifications](https://www.epson.co.in/For-Home/Scanners/A4-Home-Photo-Scanners/Epson-Perfection-V700-Photo/p/B11B178026)
+  establish RGB/grayscale output depths and 9600-DPI carriage-axis hardware
+  resolution for the provisional profile.
+- [Epson slide placement guide](https://support2.epson.net/manuals/english/scanner/perfectionv800pv850p/use_g/html/set2_2.htm)
+  and the V800/V850 user guide document the official twelve-position 35 mm Slide
+  Holder. Coordinates were measured locally, including a loaded portrait and
+  landscape check; see [holder measurements](holders.md).

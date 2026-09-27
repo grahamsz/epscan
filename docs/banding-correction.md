@@ -1,5 +1,44 @@
 # Periodic band correction: Rust implementation guide
 
+## Current implementation: refined sine backport (method version 2)
+
+epscan owns 'crates/negative-banding', an independent backport of the Photoshop
+plugin engine. Each repository builds from its own copy. The only waveform is the accepted pure sine. Detection retains the
+original FFT/coherence method; local amplitudes are refined using signed
+residuals on disjoint training and held rows, with up to four conservative
+updates. Frequencies and phases remain fixed. Unsupported regions retain their
+initial amplitudes, so the darkness guard remains enabled.
+
+Defaults are **100% fitted strength**, full darkness weight below **10%**,
+fading to zero at **60%**. '--banding-strength 0.8' remains available for a weaker
+result. The kernel is now 'clamp(raw * (1-strength*darkness*refined_sine_sum))',
+rounded once at the original 8/16-bit depth. It no longer applies an exponential.
+The raw payload and optional raw TIFF remain unchanged. Cropped outputs reuse
+the full acquisition's fit in source coordinates.
+
+Photoshop uses the same fit but encodes layers/masks with its native 0..32768
+sample grid and sequential component clipping. epscan retains full TIFF sample
+precision and clips the summed correction once; tiny quantization differences
+and differences at clipping limits are expected. Photoshop's 66% initial layer
+opacity is already compensated in its mask and is not applied again in epscan.
+
+The optional signal PNG now shows signed intensity removed, normalized by source
+full scale, after darkness and strength: red darkens, blue brightens, white is
+zero. Its 'range_fraction_full_scale' replaces the old log-gain range.
+Metadata records 'method_version: 2', 'residual_refined_linear_sine', the local
+engine version, original detector diagnostics, and residual-refinement reports.
+Detector metrics still describe the initial exponential baseline; refinement
+metrics describe the float fit and are not an independent held-out error estimate.
+
+See [engine API and tests](../crates/negative-banding/README.md).
+
+## Historical implementation notes (method version 1)
+
+The remaining specification records the original Python/exponential method and
+its 80% preset for provenance. Its defaults, output kernel, and signal-PNG units
+have been superseded by method version 2 above.
+
+
 This guide describes the experimental correction developed in the sibling
 `test_banding` workspace on 2026-09-25. It learns narrow periodic signals shared
 across the height of a negative, estimates their amplitude across the image, and
@@ -465,7 +504,8 @@ Use these existing integration points:
 - [`src/scan/frame.rs`](../src/scan/frame.rs): after publishing the completed raw
   payload and acquisition metadata, before optional export and cleanup.
 - [`src/scan/crop.rs`](../src/scan/crop.rs): the separate derived-frame export
-  path used by shared holder acquisitions applies correction after cropping.
+  path lets `scan_regions` apply the completed strip's fitted correction field
+  to each crop using its source-coordinate offset.
 - [`src/scan/sharpness.rs`](../src/scan/sharpness.rs): useful patterns for checked
   image sizes, reading rows, bounded allocations, and cancellation.
 - [`src/scan/mod.rs`](../src/scan/mod.rs): `ScanOptions::banding` and preflight;
@@ -494,14 +534,27 @@ negative positive. Apply this mask to the original negative-polarity samples.
 The sharpness module's luminance formula is not the banding mask: use the
 maximum original RGB channel as specified above.
 
-Each final frame is fitted independently in its own pixel coordinates, after
-cropping a shared acquisition. `--banding-roi` therefore uses final-frame pixel
-coordinates, and the same ROI must be valid for every requested frame.
-If a future shared-strip model is reused for a crop with origin `(ox,oy)`,
-evaluate the model at source coordinates `(x+ox,y+oy)`, including amplitude-grid
-interpolation. Equivalently, its carrier phase in crop coordinates gains
-`2*pi*f*ox`; that is the reverse of converting a detection-ROI phase to source
-coordinates. Record which coordinate system a stored model uses.
+With the default detection area, `scan_regions` batches wait for the whole strip,
+fit that shared acquisition once, and reuse the model for every frame. A crop
+with origin `(ox,oy)` evaluates the field at source coordinates `(x+ox,y+oy)`,
+including amplitude-grid interpolation. Its carrier phase in crop coordinates
+therefore gains `2*pi*f*ox`, the reverse of converting a detection-ROI phase to
+source coordinates. The unchanged packed frame and optional raw TIFF still
+contain exact cropped acquisition samples. The optional signal PNG shows the
+field applied to that frame at the same source offset.
+
+An explicit Python `detection_roi` retains its final-frame pixel coordinates: each
+frame is fitted independently after the shared acquisition completes, and the
+same ROI must be valid for every requested frame. Single-region and standalone
+exports also fit their own image. The CLI's `--banding-roi` and derived-frame
+exports keep their per-frame fitting behavior. Banding-enabled region scans never publish
+frames before their acquisition completes; they need the full analysis source.
+
+Banding metadata distinguishes `analysis_scope: "shared_capture"` from
+`"output_image"`. `analysis_source` records the analyzed payload, recorded
+SHA256, width and height; `crop_pixels` records the output rectangle in that
+source's coordinates. Signal-preview metadata additionally records
+`model_origin`. The full-strip fit's diagnostics are shared by all its frames.
 
 ### Memory, output, and provenance
 

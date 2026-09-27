@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
-//! Exact, bounded-memory extraction of frames from completed packed captures.
+// SPDX-License-Identifier: MIT
+//! Exact, bounded-memory extraction of frames from completed or committed captures.
 use super::{
     PassKind, PlannedPass, Progress, ScanOptions, ScanPlan, ScanResult, banding,
     io::{publish_payload, reserve, suffix, write_manifest},
@@ -27,6 +27,69 @@ pub struct FrameExtraction {
     pub basename: PathBuf,
 }
 
+/// One shared visible-pass fit for all crops from a completed strip.
+pub(crate) struct PreparedFrameBanding {
+    kind: PassKind,
+    fitted: banding::PreparedBanding,
+}
+
+impl PreparedFrameBanding {
+    pub(crate) fn prepare(
+        source: &ScanResult,
+        source_plan: &ScanPlan,
+        options: &ScanOptions,
+        cancel: &AtomicBool,
+    ) -> Result<Option<Self>> {
+        let Some(options) = &options.banding else {
+            return Ok(None);
+        };
+        // Explicit detection ROIs retain the existing frame-local contract.
+        // Such frames are fitted independently after their strip completes.
+        if options.detection_roi.is_some() {
+            return Ok(None);
+        }
+        let mut visible = source_plan
+            .passes
+            .iter()
+            .filter(|pass| matches!(pass.kind, PassKind::Rgb | PassKind::Gray));
+        let pass = visible
+            .next()
+            .ok_or_else(|| Error::Invalid("Banding source has no visible pass".into()))?;
+        if visible.next().is_some() {
+            return Err(Error::Invalid(
+                "Banding source has multiple visible passes".into(),
+            ));
+        }
+        let image = if pass.kind == PassKind::Rgb {
+            source.rgb.as_ref()
+        } else {
+            source.gray.as_ref()
+        }
+        .ok_or_else(|| Error::Invalid("Banding source has no visible image".into()))?;
+        if image.metadata["complete"] != true
+            || image.width != pass.pixels[2]
+            || image.height != pass.pixels[3]
+            || image.channels != pass.channels
+            || image.depth != pass.settings.depth
+            || image.dpi != pass.settings.dpi
+        {
+            return Err(Error::Invalid(
+                "Banding source is incomplete or does not match its plan".into(),
+            ));
+        }
+        Ok(Some(Self {
+            kind: pass.kind,
+            fitted: banding::PreparedBanding::prepare(image, options, cancel)?,
+        }))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AvailableInput<'a> {
+    file: &'a File,
+    bytes: u64,
+}
+
 struct Input<'a> {
     file: File,
     image: &'a ImageResult,
@@ -35,6 +98,7 @@ struct Input<'a> {
     source_stride: u64,
     pixel_bytes: u64,
     row_bytes: usize,
+    available_bytes: Option<u64>,
 }
 
 fn cancelled(cancel: &AtomicBool) -> Result<()> {
@@ -70,6 +134,7 @@ fn prepare_input<'a>(
     source_plan: &'a ScanPlan,
     target: &PlannedPass,
     caps: &Capabilities,
+    available: Option<AvailableInput<'_>>,
 ) -> Result<Input<'a>> {
     let mut matching = source_plan
         .passes
@@ -97,6 +162,7 @@ fn prepare_input<'a>(
         || pass.settings.source != target.settings.source
         || pass.settings.mode != target.settings.mode
         || pass.settings.dpi != target.settings.dpi
+        || pass.settings.y_oversampling != target.settings.y_oversampling
         || pass.settings.depth != target.settings.depth
         || pass.settings.gamma != target.settings.gamma
         || pass.settings.preview != target.settings.preview
@@ -125,14 +191,16 @@ fn prepare_input<'a>(
         || image.channels != pass.channels
         || image.depth != pass.settings.depth
         || image.dpi != pass.settings.dpi
-        || image.metadata["complete"] != true
+        || (available.is_none() && image.metadata["complete"] != true)
     {
         return Err(Error::Invalid(
             "Source image is incomplete or does not match its plan".into(),
         ));
     }
     let hash = image.metadata["sha256"].as_str().unwrap_or_default();
-    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if available.is_none()
+        && (hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
         return Err(Error::Invalid("Source image has no recorded SHA256".into()));
     }
     let pixel_bytes = u64::from(pass.channels) * u64::from(pass.settings.depth / 8);
@@ -142,9 +210,19 @@ fn prepare_input<'a>(
     let expected = source_stride
         .checked_mul(u64::from(source_height))
         .ok_or_else(|| Error::Invalid("Source image size overflow".into()))?;
-    let file = File::open(&image.payload)?;
+    let file = if let Some(available) = available {
+        available.file.try_clone()?
+    } else {
+        File::open(&image.payload)?
+    };
     let info = file.metadata()?;
-    if expected != pass.expected_bytes || !info.is_file() || info.len() != expected {
+    let length_valid = if let Some(available) = available {
+        let frame_end = u64::from(relative_y + height) * source_stride;
+        frame_end <= available.bytes && available.bytes <= info.len() && info.len() <= expected
+    } else {
+        info.len() == expected
+    };
+    if expected != pass.expected_bytes || !info.is_file() || !length_valid {
         return Err(Error::Invalid(
             "Source payload size does not match its packed pixel plan".into(),
         ));
@@ -161,6 +239,7 @@ fn prepare_input<'a>(
         source_stride,
         pixel_bytes,
         row_bytes,
+        available_bytes: available.map(|value| value.bytes),
     })
 }
 
@@ -178,14 +257,28 @@ fn source_metadata(source: &ScanResult, input: &Input<'_>) -> Value {
             object.remove(field);
         }
     }
-    json!({
+    let mut metadata = json!({
         "manifest":source.manifest,
         "sha256":input.image.metadata["sha256"],
         "hash_basis":"recorded source acquisition; source must remain unchanged during extraction",
         "settings":input.pass.settings,
         "pixels":input.pass.pixels,
         "recorded_metadata":recorded,
-    })
+    });
+    if let Some(available) = input.available_bytes {
+        metadata["sha256"] = Value::Null;
+        metadata["hash_basis"] =
+            "provisional acquisition snapshot; consult source manifest for final full-strip SHA256"
+                .into();
+        metadata["acquisition_complete"] = false.into();
+        metadata["committed_prefix_bytes"] = available.into();
+        metadata["recorded_metadata"]["complete"] = false.into();
+        metadata["recorded_metadata"]["acquisition_complete"] = false.into();
+        if let Some(recorded) = metadata["recorded_metadata"].as_object_mut() {
+            recorded.remove("sha256");
+        }
+    }
+    metadata
 }
 
 /// Extract unchanged packed samples from completed raw captures, without I/O to
@@ -204,13 +297,103 @@ pub fn extract_frame(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(Progress<'_>) -> bool,
 ) -> Result<ScanResult> {
+    extract_frame_with_banding(source, source_plan, target, caps, cancel, progress, None)
+}
+
+/// Reuse a completed strip's correction model for the requested frame.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn extract_frame_with_banding(
+    source: &ScanResult,
+    source_plan: &ScanPlan,
+    target: &FrameExtraction,
+    caps: &Capabilities,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(Progress<'_>) -> bool,
+    prepared: Option<&PreparedFrameBanding>,
+) -> Result<ScanResult> {
+    extract_frame_inner(
+        source,
+        source_plan,
+        target,
+        caps,
+        cancel,
+        progress,
+        prepared,
+        None,
+    )
+}
+
+/// Extract one visible frame from an immutable, committed prefix while later
+/// rows are still arriving. `file` must be opened separately from the writer,
+/// and `available_bytes` must include only successfully acquired blocks.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn extract_available_frame(
+    source: &ScanResult,
+    source_plan: &ScanPlan,
+    target: &FrameExtraction,
+    caps: &Capabilities,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(Progress<'_>) -> bool,
+    file: &File,
+    available_bytes: u64,
+) -> Result<ScanResult> {
+    extract_frame_inner(
+        source,
+        source_plan,
+        target,
+        caps,
+        cancel,
+        progress,
+        None,
+        Some(AvailableInput {
+            file,
+            bytes: available_bytes,
+        }),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extract_frame_inner(
+    source: &ScanResult,
+    source_plan: &ScanPlan,
+    target: &FrameExtraction,
+    caps: &Capabilities,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(Progress<'_>) -> bool,
+    prepared: Option<&PreparedFrameBanding>,
+    available: Option<AvailableInput<'_>>,
+) -> Result<ScanResult> {
     cancelled(cancel)?;
     let plan = target.options.plan(&target.settings, caps)?;
+    if available.is_some()
+        && (target.options.banding.is_some()
+            || plan.passes.len() != 1
+            || !matches!(plan.passes[0].kind, PassKind::Rgb | PassKind::Gray))
+    {
+        return Err(Error::Invalid(
+            "Early frame extraction requires one visible pass without banding correction".into(),
+        ));
+    }
     let mut inputs = plan
         .passes
         .iter()
-        .map(|pass| prepare_input(source, source_plan, pass, caps))
+        .map(|pass| prepare_input(source, source_plan, pass, caps, available))
         .collect::<Result<Vec<_>>>()?;
+    if let Some(prepared) = prepared {
+        let valid = inputs.iter().any(|input| {
+            input.pass.kind == prepared.kind
+                && target
+                    .options
+                    .banding
+                    .as_ref()
+                    .is_some_and(|options| prepared.fitted.matches_source(input.image, options))
+        });
+        if !valid {
+            return Err(Error::Invalid(
+                "Prepared banding model does not match crop source or options".into(),
+            ));
+        }
+    }
     let holder = target
         .options
         .holder_selection
@@ -265,7 +448,9 @@ pub fn extract_frame(
                 "requested_rect_mm":pass.settings.rect_mm,
                 "effective_rect_mm":([x,y,width,height].map(|v|f64::from(v)*25.4/f64::from(pass.settings.dpi))),
                 "crop_pixels":input.relative,"effective_pixels":pass.pixels,
-                "sample_transform":"none; exact packed samples",
+                "sample_transform":if pass.settings.y_oversampling > 1 {
+                    "exact crop of Y-row-averaged packed samples"
+                } else { "none; exact packed samples" },
                 "source_capture":source_metadata(source,input),
                 "extracted_bytes":0,
             });
@@ -357,7 +542,16 @@ pub fn extract_frame(
                     && let Some(banding_options) = &target.options.banding
                 {
                     report(cancel, progress, "banding", index, 0, 0)?;
-                    banding::export(&mut image, &tiff, banding_options, cancel)?;
+                    if let Some(prepared) = prepared {
+                        prepared.fitted.export_crop(
+                            &mut image,
+                            [input.relative[0], input.relative[1]],
+                            &tiff,
+                            cancel,
+                        )?;
+                    } else {
+                        banding::export(&mut image, &tiff, banding_options, cancel)?;
+                    }
                     meta["banding"] = image.metadata["banding"].clone();
                 } else {
                     report(cancel, progress, "saving", index, 0, 0)?;
@@ -499,6 +693,176 @@ mod tests {
             cropped.extend_from_slice(&bytes[offset..offset + width * pixel_bytes]);
         }
         cropped
+    }
+
+    #[test]
+    fn shared_banding_fit_retains_full_strip_provenance_and_frame_roi_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let (source, plan) = source_fixture(
+            directory.path(),
+            &ScanSettings {
+                mode: crate::ScanMode::Gray,
+                ..settings([40, 50, 256, 160], 16)
+            },
+            &ScanOptions::default(),
+        );
+        let cancel = AtomicBool::new(false);
+        let mut options = ScanOptions {
+            banding: Some(banding::BandingOptions::default()),
+            ..Default::default()
+        };
+        let prepared = PreparedFrameBanding::prepare(&source, &plan, &options, &cancel)
+            .unwrap()
+            .unwrap();
+        let target = FrameExtraction {
+            settings: ScanSettings {
+                mode: crate::ScanMode::Gray,
+                ..settings([72, 66, 128, 96], 16)
+            },
+            options: options.clone(),
+            basename: directory.path().join("shared"),
+        };
+        let result = extract_frame_with_banding(
+            &source,
+            &plan,
+            &target,
+            &capabilities(),
+            &cancel,
+            &mut |_| true,
+            Some(&prepared),
+        )
+        .unwrap();
+        let image = result.gray.unwrap();
+        assert_eq!(
+            fs::read(&image.payload).unwrap(),
+            raw_slice(source.gray.as_ref().unwrap(), [32, 16, 128, 96])
+        );
+        assert_eq!(
+            image.metadata["banding"]["analysis_scope"],
+            "shared_capture"
+        );
+        assert_eq!(
+            image.metadata["banding"]["analysis_source"]["sha256"],
+            source.gray.as_ref().unwrap().metadata["sha256"]
+        );
+        assert_eq!(
+            image.metadata["banding"]["crop_pixels"],
+            json!([32, 16, 128, 96])
+        );
+        options.banding.as_mut().unwrap().detection_roi = Some([10, 110, 4, 80]);
+        assert!(
+            PreparedFrameBanding::prepare(&source, &plan, &options, &cancel)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn committed_prefix_extracts_exact_frame_without_claiming_complete_source() {
+        for (mode, depth) in [(crate::ScanMode::Gray, 16), (crate::ScanMode::Rgb, 8)] {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut source, plan) = source_fixture(
+                directory.path(),
+                &ScanSettings {
+                    mode,
+                    ..settings([40, 50, 32, 64], depth)
+                },
+                &ScanOptions::default(),
+            );
+            let original = if mode == crate::ScanMode::Gray {
+                source.gray.as_mut().unwrap()
+            } else {
+                source.rgb.as_mut().unwrap()
+            };
+            let relative = [3, 10, 16, 7];
+            let expected = raw_slice(original, relative);
+            let row_bytes = u64::from(original.width)
+                * u64::from(original.channels)
+                * u64::from(original.depth / 8);
+            let committed = 17 * row_bytes;
+            let bytes = fs::read(&original.payload).unwrap();
+            fs::write(&original.payload, &bytes[..committed as usize]).unwrap();
+            original.metadata["complete"] = false.into();
+            original.metadata["acquisition_complete"] = false.into();
+            original.metadata.as_object_mut().unwrap().remove("sha256");
+            let file = File::open(&original.payload).unwrap();
+            fs::rename(
+                &original.payload,
+                original.payload.with_extension("published.bin"),
+            )
+            .unwrap();
+            let target = FrameExtraction {
+                settings: ScanSettings {
+                    mode,
+                    ..settings([43, 60, 16, 7], depth)
+                },
+                options: ScanOptions::default(),
+                basename: directory.path().join("streamed"),
+            };
+            let result = extract_available_frame(
+                &source,
+                &plan,
+                &target,
+                &capabilities(),
+                &AtomicBool::new(false),
+                &mut |_| true,
+                &file,
+                committed,
+            )
+            .unwrap();
+            let image = result.gray.or(result.rgb).unwrap();
+            assert_eq!(fs::read(&image.payload).unwrap(), expected);
+            assert_eq!(image.metadata["complete"], true);
+            assert_eq!(image.metadata["sha256"], hex(&Sha256::digest(&expected)));
+            assert!(image.tiff.unwrap().is_file());
+            assert_eq!(image.metadata["source_capture"]["sha256"], Value::Null);
+            assert_eq!(
+                image.metadata["source_capture"]["acquisition_complete"],
+                false
+            );
+            assert_eq!(
+                image.metadata["source_capture"]["recorded_metadata"]["complete"],
+                false
+            );
+            assert_eq!(
+                image.metadata["source_capture"]["committed_prefix_bytes"],
+                committed
+            );
+        }
+    }
+
+    #[test]
+    fn committed_prefix_rejects_uncommitted_rows_even_if_already_on_disk() {
+        let directory = tempfile::tempdir().unwrap();
+        let (source, plan) = source_fixture(
+            directory.path(),
+            &settings([40, 50, 32, 64], 8),
+            &ScanOptions::default(),
+        );
+        let image = source.rgb.as_ref().unwrap();
+        let file = File::open(&image.payload).unwrap();
+        let target = FrameExtraction {
+            settings: settings([43, 60, 16, 7], 8),
+            options: ScanOptions::default(),
+            basename: directory.path().join("not-ready"),
+        };
+        let row_bytes = u64::from(image.width) * u64::from(image.channels);
+        for watermark in [0, 17 * row_bytes - 1, plan.passes[0].expected_bytes + 1] {
+            assert!(
+                extract_available_frame(
+                    &source,
+                    &plan,
+                    &target,
+                    &capabilities(),
+                    &AtomicBool::new(false),
+                    &mut |_| true,
+                    &file,
+                    watermark
+                )
+                .is_err()
+            );
+        }
+        assert!(!directory.path().join("not-ready_1.json").exists());
     }
 
     #[test]
@@ -765,6 +1129,7 @@ mod tests {
         let caps = capabilities();
         let selection = HolderSelection {
             holder: crate::capabilities::Holder::V800Film35mm,
+            frame_format: None,
             frame: 1,
             overage_percent: 0.0,
         };

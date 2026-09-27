@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: MIT
 //! CLI output retention. Library callers retain their reusable raw payloads.
 use epscan::{Result, ScanResult};
 use serde_json::{Value, json};

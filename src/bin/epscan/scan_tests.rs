@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: MIT
 use super::{
     CaptureBatch, CaptureJob, CaptureSelection, acquire, prepare_batches, prepare_jobs,
     result_document,

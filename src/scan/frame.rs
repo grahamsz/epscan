@@ -1,16 +1,26 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
-use super::{PassKind, Progress, ScanOptions, ScanResult, banding, io::*, sharpness};
+// SPDX-License-Identifier: MIT
+use super::{
+    PassKind, Progress, ScanOptions, ScanResult, banding, io::*, sampling::RowAverager, sharpness,
+};
 use crate::{
     Error, Result, ScanSettings, Session,
     protocol::hex,
     session::{image::ImageResult, now},
 };
 use std::{
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     path::Path,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::Duration,
 };
+
+pub(crate) enum CaptureUpdate {
+    Started {
+        source: Box<ScanResult>,
+        reader: File,
+    },
+    Available(u64),
+}
 
 impl Session {
     /// Acquire a validated job to numbered raw payloads and optional TIFFs.
@@ -26,6 +36,18 @@ impl Session {
         basename: &Path,
         cancel: &AtomicBool,
         progress: &mut dyn FnMut(Progress<'_>) -> bool,
+    ) -> Result<ScanResult> {
+        self.scan_observed(settings, options, basename, cancel, progress, None)
+    }
+
+    pub(crate) fn scan_observed(
+        &mut self,
+        settings: &ScanSettings,
+        options: &ScanOptions,
+        basename: &Path,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(Progress<'_>) -> bool,
+        mut observer: Option<&mut dyn FnMut(CaptureUpdate)>,
     ) -> Result<ScanResult> {
         self.protocol()?;
         let capabilities = self.capabilities.clone();
@@ -113,6 +135,10 @@ impl Session {
                 let channels = pass.channels;
                 let stride =
                     u64::from(width) * u64::from(channels) * u64::from(pass_settings.depth / 8);
+                let acquisition_bytes = pass
+                    .expected_bytes
+                    .checked_mul(u64::from(pass_settings.y_oversampling))
+                    .ok_or_else(|| Error::Invalid("Y acquisition payload size overflow".into()))?;
                 let tail = pass.kind.suffix();
                 let partial = suffix(&stem, &format!("{tail}.partial.bin"));
                 let payload = suffix(&stem, &format!("{tail}.bin"));
@@ -126,6 +152,20 @@ impl Session {
                     "orientation":"device_order; no flip/rotation; target verification pending",
                     "optics":capabilities.optics(pass_settings.source)?,
                     "effective_optical_dpi":null,"spectral_identity_verified":false});
+                if pass_settings.y_oversampling > 1 {
+                    meta["sampling"] = serde_json::json!({
+                        "y_oversampling":pass_settings.y_oversampling,
+                        "acquisition_dpi":[pass_settings.dpi,pass_settings.acquisition_y_dpi()?],
+                        "acquisition_pixels":pass_settings.acquisition_pixels_for(model)?,
+                        "acquisition_bytes":acquisition_bytes,
+                        "output_dpi":[pass_settings.dpi,pass_settings.dpi],
+                        "method":"arithmetic mean of consecutive carriage rows; round half upward",
+                        "individual_rows_retained":false
+                    });
+                    meta["sample_transform"] =
+                        "Y row averaging before packed payload; no inversion or tone conversion"
+                            .into();
+                }
                 if let Some(selection) = &holder_selection {
                     meta["holder_selection"] = selection.clone();
                 }
@@ -140,6 +180,11 @@ impl Session {
                     .write(true)
                     .create_new(true)
                     .open(&partial)?;
+                // This independent cursor survives publication of the partial file.
+                let reader = observer
+                    .as_ref()
+                    .map(|_| File::open(&partial))
+                    .transpose()?;
                 meta["partial_payload_file"] = partial.to_string_lossy().to_string().into();
                 manifest["passes"][index] = meta.clone();
                 write_manifest(&mut manifest_file, &manifest)?;
@@ -154,13 +199,54 @@ impl Session {
                 write_manifest(&mut manifest_file, &manifest)?;
                 self.protocol()?
                     .wait_ready(cancel, options.pass_timeout.min(ready_timeout))?;
+                if let (Some(observer), Some(reader)) = (observer.as_deref_mut(), reader) {
+                    let image = ImageResult {
+                        payload: payload.clone(),
+                        tiff: None,
+                        width,
+                        height,
+                        channels,
+                        depth: pass_settings.depth,
+                        dpi: pass_settings.dpi,
+                        metadata: meta.clone(),
+                    };
+                    let mut source = ScanResult {
+                        rgb: None,
+                        gray: None,
+                        ir: None,
+                        thumbnail: None,
+                        manifest: manifest_path.clone(),
+                    };
+                    match pass.kind {
+                        PassKind::Rgb => source.rgb = Some(image),
+                        PassKind::Gray => source.gray = Some(image),
+                        PassKind::Ir => source.ir = Some(image),
+                        PassKind::Thumbnail => source.thumbnail = Some(image),
+                    }
+                    observer(CaptureUpdate::Started {
+                        source: Box::new(source),
+                        reader,
+                    });
+                }
                 let started = now();
-                let transfer = self.protocol()?.acquire_with_policy(
-                    pass.expected_bytes,
+                let committed = AtomicU64::new(0);
+                let mut averaged = RowAverager::new(
                     &mut sink,
+                    usize::try_from(stride)
+                        .map_err(|_| Error::Invalid("Row stride exceeds address space".into()))?,
+                    pass_settings.depth,
+                    pass_settings.y_oversampling,
+                    &committed,
+                );
+                let transfer = self.protocol()?.acquire_with_policy(
+                    acquisition_bytes,
+                    &mut averaged,
                     cancel,
                     options.pass_timeout,
                     &mut |done, total| {
+                        if let Some(observer) = observer.as_deref_mut() {
+                            observer(CaptureUpdate::Available(committed.load(Ordering::Acquire)));
+                        }
                         progress(Progress {
                             phase: name,
                             pass: index,
@@ -170,6 +256,8 @@ impl Session {
                     },
                     &model.transfer,
                 )?;
+                averaged.finish()?;
+                drop(averaged);
                 sink.sync_all()?;
                 drop(sink);
                 meta["transfer"] = serde_json::to_value(transfer)?;
@@ -328,7 +416,8 @@ mod tests {
             crate::ScanMode::Rgb => 3,
             crate::ScanMode::Gray => 1,
         };
-        let payload_bytes = width * height * channels * u32::from(settings.depth / 8);
+        let payload_bytes =
+            width * height * channels * u32::from(settings.depth / 8) * settings.y_oversampling;
         bytes.extend([6; 5]); // reset, parameters and focus; no default LUT upload
         bytes.extend(settings.parameters(false).unwrap());
         bytes.extend([0; 16]);
@@ -336,7 +425,14 @@ mod tests {
         for word in [0u32, 0, payload_bytes] {
             bytes.extend(word.to_le_bytes());
         }
-        bytes.extend(std::iter::repeat_n(0x31, payload_bytes as usize));
+        if settings.y_oversampling == 1 {
+            bytes.extend(std::iter::repeat_n(0x31, payload_bytes as usize));
+        } else {
+            let stride = width * channels * u32::from(settings.depth / 8);
+            for row in 0..height * settings.y_oversampling {
+                bytes.extend(std::iter::repeat_n(row as u8, stride as usize));
+            }
+        }
         bytes.push(0);
         let writes = Arc::new(Mutex::new(Vec::new()));
         let device = Device {
@@ -356,6 +452,69 @@ mod tests {
         )
         .unwrap();
         (session, settings, writes)
+    }
+
+    #[test]
+    fn oversampling_acquires_extra_rows_but_exports_square_pixels_at_both_depths() {
+        for mode in [crate::ScanMode::Gray, crate::ScanMode::Rgb] {
+            for depth in [8, 16] {
+                let settings = ScanSettings {
+                    mode,
+                    depth,
+                    y_oversampling: 3,
+                    rect_mm: [0.0, 0.0, 1.0, 1.0],
+                    ..Default::default()
+                };
+                let (mut session, settings, _) = session_with_settings(settings);
+                let directory = tempfile::tempdir().unwrap();
+                let mut last_progress = (0, 0);
+                let mut watermarks = Vec::new();
+                let result = session
+                    .scan_observed(
+                        &settings,
+                        &ScanOptions::default(),
+                        &directory.path().join("sampled"),
+                        &AtomicBool::new(false),
+                        &mut |update| {
+                            if update.total > 1 {
+                                last_progress = (update.done, update.total);
+                            }
+                            true
+                        },
+                        Some(&mut |update| {
+                            if let CaptureUpdate::Available(done) = update {
+                                watermarks.push(done);
+                            }
+                        }),
+                    )
+                    .unwrap();
+                let image = result.gray.or(result.rgb).unwrap();
+                assert_eq!((image.width, image.height, image.dpi), (8, 12, 300));
+                let stride =
+                    image.width as usize * usize::from(image.channels) * usize::from(depth / 8);
+                let expected: Vec<u8> = (0..12)
+                    .flat_map(|row| std::iter::repeat_n((row * 3 + 1) as u8, stride))
+                    .collect();
+                assert_eq!(fs::read(&image.payload).unwrap(), expected);
+                assert_eq!(
+                    last_progress,
+                    (image.expected_bytes() * 3, image.expected_bytes() * 3)
+                );
+                assert_eq!(watermarks.last(), Some(&image.expected_bytes()));
+                assert!(watermarks.iter().all(|done| done % stride as u64 == 0));
+                assert_eq!(
+                    image.metadata["sampling"]["acquisition_dpi"],
+                    serde_json::json!([300, 900])
+                );
+                let mut decoder =
+                    tiff::decoder::Decoder::new(File::open(image.tiff.unwrap()).unwrap()).unwrap();
+                assert_eq!(decoder.dimensions().unwrap(), (8, 12));
+                assert_eq!(
+                    decoder.get_tag_u32(tiff::tags::Tag::ImageLength).unwrap(),
+                    12
+                );
+            }
+        }
     }
 
     #[test]
@@ -453,6 +612,7 @@ mod tests {
         use crate::{capabilities::V800_FAMILY, scan::HolderSelection};
         let selection = HolderSelection {
             holder: crate::capabilities::Holder::V800Film35mm,
+            frame_format: None,
             frame: 1,
             overage_percent: 5.0,
         };

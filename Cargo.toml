@@ -1,9 +1,13 @@
+[workspace]
+members = ["crates/negative-banding"]
+resolver = "3"
+
 [package]
 name = "epscan"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 description = "Direct Epson ESC/I scanner library and command-line interface"
 readme = "README.md"
 keywords = ["scanner", "film", "epson", "usb", "esci"]
@@ -32,8 +36,7 @@ thiserror = "2"
 tiff = { version = "0.11", default-features = false }
 sha2 = "0.10"
 log = "0.4"
-rustfft = "6.4"
-nalgebra = { version = "0.33", default-features = false, features = ["std"] }
+negative-banding = { version = "0.1.0", path = "crates/negative-banding" }
 png = "0.17"
 clap = { version = "4", features = ["derive"], optional = true }
 tracing = { version = "0.1", optional = true }

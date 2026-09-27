@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: MIT
 //! Epson model policy. Add a profile here before enabling another scanner.
 //!
 //! Device-advertised dimensions and DPI remain in [`Capabilities`]; this registry
@@ -48,12 +48,67 @@ pub enum Holder {
     #[serde(rename = "v800-35mm")]
     #[cfg_attr(feature = "cli", value(name = "v800-35mm"))]
     V800Film35mm,
+    /// Measured single-sheet opening in the V800-family 4 × 5 inch holder.
+    #[serde(rename = "v800-4x5")]
+    #[cfg_attr(feature = "cli", value(name = "v800-4x5"))]
+    V800Film4x5,
+    /// Measured continuous opening in the V800-family medium-format holder.
+    #[serde(rename = "v800-medium-format")]
+    #[cfg_attr(feature = "cli", value(name = "v800-medium-format"))]
+    V800MediumFormat,
+    /// Twelve mounted slides, numbered left to right and top to bottom.
+    #[serde(rename = "v800-slides")]
+    #[cfg_attr(feature = "cli", value(name = "v800-slides"))]
+    V800Slides,
+}
+
+/// Nominal exposure sizes; camera gates, spacing, and film placement vary.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+pub enum FrameFormat {
+    #[serde(rename = "35mm")]
+    #[cfg_attr(feature = "cli", value(name = "35mm"))]
+    Film35mm,
+    #[serde(rename = "35mm-half")]
+    #[cfg_attr(feature = "cli", value(name = "35mm-half"))]
+    Film35mmHalf,
+    #[serde(rename = "6x4.5")]
+    #[cfg_attr(feature = "cli", value(name = "6x4.5"))]
+    Film6x45,
+    #[serde(rename = "6x6")]
+    #[cfg_attr(feature = "cli", value(name = "6x6"))]
+    Film6x6,
+    #[serde(rename = "6x7")]
+    #[cfg_attr(feature = "cli", value(name = "6x7"))]
+    Film6x7,
+    #[serde(rename = "6x8")]
+    #[cfg_attr(feature = "cli", value(name = "6x8"))]
+    Film6x8,
+    #[serde(rename = "6x9")]
+    #[cfg_attr(feature = "cli", value(name = "6x9"))]
+    Film6x9,
+    #[serde(rename = "6x12")]
+    #[cfg_attr(feature = "cli", value(name = "6x12"))]
+    Film6x12,
+    #[serde(rename = "6x17")]
+    #[cfg_attr(feature = "cli", value(name = "6x17"))]
+    Film6x17,
+}
+
+/// Starter crop positions for a film format within its physical holder.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct HolderFormatLayout {
+    pub format: FrameFormat,
+    pub name: &'static str,
+    pub frames_mm: &'static [[f64; 4]],
+    pub strip_groups: &'static [&'static [u32]],
 }
 
 /// Nominal frame positions in source millimetres, in device-order preview
 /// orientation. Array order defines the one-based frame numbers.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct HolderLayout {
+    pub default_film_type: Option<&'static str>,
     pub holder: Holder,
     pub name: &'static str,
     pub source: Source,
@@ -61,9 +116,37 @@ pub struct HolderLayout {
     /// Continuous film strips, each listing its one-based frame numbers.
     /// An empty list or a frame absent from every group means separate captures.
     pub strip_groups: &'static [&'static [u32]],
+    /// Default exposure format; fixed sheet holders have no format selector.
+    pub default_format: Option<FrameFormat>,
+    pub formats: &'static [HolderFormatLayout],
+    /// Physical continuous openings, before preview padding. Their order matches
+    /// `strip_groups`; they do not shrink when a shorter format is selected.
+    pub strip_rects_mm: &'static [[f64; 4]],
 }
 
 impl HolderLayout {
+    /// Resolve compatible exposure presets while retaining the physical holder.
+    pub fn for_format(&self, format: Option<FrameFormat>) -> Result<Self> {
+        let Some(format) = format.or(self.default_format) else {
+            return Ok(*self);
+        };
+        let preset = self
+            .formats
+            .iter()
+            .find(|preset| preset.format == format)
+            .ok_or_else(|| {
+                Error::Invalid(format!(
+                    "Frame format {format:?} is not supported by {}",
+                    self.name
+                ))
+            })?;
+        Ok(Self {
+            frames_mm: preset.frames_mm,
+            strip_groups: preset.strip_groups,
+            ..*self
+        })
+    }
+
     /// Return the one-based continuous-strip identifier for a registered frame.
     /// Reject ambiguous or invalid registry entries rather than guessing a group.
     pub fn strip_for_frame(&self, frame: u32) -> Result<Option<u32>> {
@@ -173,6 +256,8 @@ pub struct SourceCapabilities {
     /// Supported requested output range, distinct from nominal optical DPI.
     pub min_dpi: u32,
     pub max_dpi: u32,
+    /// Manufacturer's carriage-axis hardware sampling limit, excluding interpolation.
+    pub max_y_dpi: u32,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -220,6 +305,7 @@ impl TransferQuirks {
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct ScannerModel {
     pub name: &'static str,
+    pub support_status: &'static str,
     pub vid: u16,
     pub pid: u16,
     pub identity_names: &'static [&'static str],
@@ -255,6 +341,18 @@ impl ScannerModel {
         overage_percent: f64,
     ) -> Result<[f64; 4]> {
         self.holder(holder)?.frame_rect(frame, overage_percent)
+    }
+
+    pub fn holder_frame_with_format(
+        &self,
+        holder: Holder,
+        frame_format: Option<FrameFormat>,
+        frame: u32,
+        overage_percent: f64,
+    ) -> Result<[f64; 4]> {
+        self.holder(holder)?
+            .for_format(frame_format)?
+            .frame_rect(frame, overage_percent)
     }
 
     pub fn source(&self, source: Source) -> Result<&SourceCapabilities> {
@@ -318,6 +416,7 @@ const V800_SOURCES: &[SourceCapabilities] = &[
         infrared_option: None,
         min_dpi: 25,
         max_dpi: 12800,
+        max_y_dpi: 9600,
     },
     SourceCapabilities {
         source: Source::Transparency,
@@ -332,6 +431,7 @@ const V800_SOURCES: &[SourceCapabilities] = &[
         infrared_option: Some(3),
         min_dpi: 25,
         max_dpi: 12800,
+        max_y_dpi: 9600,
     },
     SourceCapabilities {
         source: Source::Transparency8x10,
@@ -346,6 +446,7 @@ const V800_SOURCES: &[SourceCapabilities] = &[
         infrared_option: None,
         min_dpi: 25,
         max_dpi: 12800,
+        max_y_dpi: 9600,
     },
 ];
 
@@ -378,22 +479,192 @@ const V800_35MM_FRAMES: &[[f64; 4]] = &[
     [121.5, 206.5, 24.0, 36.0],
 ];
 
-const V800_HOLDERS: &[HolderLayout] = &[HolderLayout {
-    holder: Holder::V800Film35mm,
-    name: "Epson V800/V850 35 mm Film Strip Holder",
-    source: Source::Transparency,
-    frames_mm: V800_35MM_FRAMES,
-    strip_groups: &[
-        &[1, 2, 3, 4, 5, 6],
-        &[7, 8, 9, 10, 11, 12],
-        &[13, 14, 15, 16, 17, 18],
-    ],
-}];
+// Visible opening measured with a loaded negative on 2026-09-26, from the
+// 300-DPI, 1768 x 2910 device-order transparency preview retained locally as
+// captures/holder-4x5-20260926/overview-300_1.tiff. The mask covers the edges
+// of the nominal 101.6 x 127 mm sheet; placement and skew still vary slightly.
+const V800_4X5_FRAMES: &[[f64; 4]] = &[[27.0, 48.0, 94.0, 119.0]];
+
+const V800_35MM_GROUPS: &[&[u32]] = &[
+    &[1, 2, 3, 4, 5, 6],
+    &[7, 8, 9, 10, 11, 12],
+    &[13, 14, 15, 16, 17, 18],
+];
+
+// Half-frame exposures run along the strip on half the calibrated full-frame
+// pitch. These are starter crops; real camera gates and loading offsets vary.
+const fn half_frames() -> [[f64; 4]; 36] {
+    let mut frames = [[0.0; 4]; 36];
+    let mut index = 0;
+    while index < frames.len() {
+        frames[index] = [
+            [2.3, 62.1, 121.5][index / 12],
+            16.5 + (index % 12) as f64 * 19.0,
+            24.0,
+            18.0,
+        ];
+        index += 1;
+    }
+    frames
+}
+
+const V800_35MM_HALF_FRAMES: &[[f64; 4]] = &half_frames();
+const V800_35MM_HALF_GROUPS: &[&[u32]] = &[
+    &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+    &[13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24],
+    &[25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36],
+];
+const V800_35MM_FORMATS: &[HolderFormatLayout] = &[
+    HolderFormatLayout {
+        format: FrameFormat::Film35mm,
+        name: "35 mm (24 x 36 mm)",
+        frames_mm: V800_35MM_FRAMES,
+        strip_groups: V800_35MM_GROUPS,
+    },
+    HolderFormatLayout {
+        format: FrameFormat::Film35mmHalf,
+        name: "35 mm half-frame (24 x 18 mm)",
+        frames_mm: V800_35MM_HALF_FRAMES,
+        strip_groups: V800_35MM_HALF_GROUPS,
+    },
+];
+
+// Measured empty on 2026-09-26 in the full-source 300-DPI RGB8 preview:
+// captures/holder-medium-20260926/overview-300_1.tiff (1768 x 2910).
+// No film was available: this registers the aperture, not exposure positions.
+const V800_MEDIUM_OPENING: [f64; 4] = [45.1, 33.5, 57.6, 200.0];
+
+const fn medium_frames<const N: usize>(height: f64) -> [[f64; 4]; N] {
+    let [x, y, width, length] = V800_MEDIUM_OPENING;
+    let occupied = N as f64 * height + (N - 1) as f64 * 2.0;
+    let mut frames = [[0.0; 4]; N];
+    let mut index = 0;
+    while index < N {
+        frames[index] = [
+            x + (width - 56.0) / 2.0,
+            y + (length - occupied) / 2.0 + index as f64 * (height + 2.0),
+            56.0,
+            height,
+        ];
+        index += 1;
+    }
+    frames
+}
+
+const V800_MEDIUM_FORMATS: &[HolderFormatLayout] = &[
+    HolderFormatLayout {
+        format: FrameFormat::Film6x45,
+        name: "6 x 4.5 (56 x 41.5 mm)",
+        frames_mm: &medium_frames::<4>(41.5),
+        strip_groups: &[&[1, 2, 3, 4]],
+    },
+    HolderFormatLayout {
+        format: FrameFormat::Film6x6,
+        name: "6 x 6 (56 x 56 mm)",
+        frames_mm: &medium_frames::<3>(56.0),
+        strip_groups: &[&[1, 2, 3]],
+    },
+    HolderFormatLayout {
+        format: FrameFormat::Film6x7,
+        name: "6 x 7 (56 x 69 mm)",
+        frames_mm: &medium_frames::<2>(69.0),
+        strip_groups: &[&[1, 2]],
+    },
+    HolderFormatLayout {
+        format: FrameFormat::Film6x8,
+        name: "6 x 8 (56 x 76 mm)",
+        frames_mm: &medium_frames::<2>(76.0),
+        strip_groups: &[&[1, 2]],
+    },
+    HolderFormatLayout {
+        format: FrameFormat::Film6x9,
+        name: "6 x 9 (56 x 84 mm)",
+        frames_mm: &medium_frames::<2>(84.0),
+        strip_groups: &[&[1, 2]],
+    },
+    HolderFormatLayout {
+        format: FrameFormat::Film6x12,
+        name: "6 x 12 (56 x 112 mm)",
+        frames_mm: &medium_frames::<1>(112.0),
+        strip_groups: &[&[1]],
+    },
+    HolderFormatLayout {
+        format: FrameFormat::Film6x17,
+        name: "6 x 17 (56 x 168 mm)",
+        frames_mm: &medium_frames::<1>(168.0),
+        strip_groups: &[&[1]],
+    },
+];
+
+const V800_HOLDERS: &[HolderLayout] = &[
+    HolderLayout {
+        holder: Holder::V800Slides,
+        default_film_type: Some("positive"),
+        name: "Epson V800/V850 35 mm Slide Holder",
+        source: Source::Transparency,
+        frames_mm: &[
+            [2.7, 33.1, 36.0, 36.0],
+            [56.1, 33.1, 36.0, 36.0],
+            [109.3, 33.1, 36.0, 36.0],
+            [2.7, 91.1, 36.0, 36.0],
+            [56.0, 91.1, 36.0, 36.0],
+            [109.2, 91.1, 36.0, 36.0],
+            [2.5, 151.1, 36.0, 36.0],
+            [55.8, 151.1, 36.0, 36.0],
+            [109.1, 151.1, 36.0, 36.0],
+            [2.4, 209.1, 36.0, 36.0],
+            [55.7, 209.1, 36.0, 36.0],
+            [109.0, 209.1, 36.0, 36.0],
+        ],
+        strip_groups: &[],
+        default_format: None,
+        formats: &[],
+        strip_rects_mm: &[],
+    },
+    HolderLayout {
+        holder: Holder::V800Film35mm,
+        default_film_type: None,
+        name: "Epson V800/V850 35 mm Film Strip Holder",
+        source: Source::Transparency,
+        frames_mm: V800_35MM_FRAMES,
+        strip_groups: V800_35MM_GROUPS,
+        default_format: Some(FrameFormat::Film35mm),
+        formats: V800_35MM_FORMATS,
+        strip_rects_mm: &[
+            [2.3, 16.5, 24.0, 227.0],
+            [62.1, 16.5, 24.0, 227.0],
+            [121.5, 16.5, 24.0, 227.0],
+        ],
+    },
+    HolderLayout {
+        holder: Holder::V800Film4x5,
+        default_film_type: None,
+        name: "Epson V800/V850 4 x 5 inch Film Holder",
+        source: Source::Transparency,
+        frames_mm: V800_4X5_FRAMES,
+        strip_groups: &[],
+        default_format: None,
+        formats: &[],
+        strip_rects_mm: &[],
+    },
+    HolderLayout {
+        holder: Holder::V800MediumFormat,
+        default_film_type: None,
+        name: "Epson V800/V850 Medium Format Film Holder",
+        source: Source::Transparency,
+        frames_mm: V800_MEDIUM_FORMATS[1].frames_mm,
+        strip_groups: V800_MEDIUM_FORMATS[1].strip_groups,
+        default_format: Some(FrameFormat::Film6x6),
+        formats: V800_MEDIUM_FORMATS,
+        strip_rects_mm: &[V800_MEDIUM_OPENING],
+    },
+];
 
 /// First supported family. Sharing a USB ID is not a guarantee of a tested model;
 /// an exact identity and command-level match is required when opening a session.
 pub const V800_FAMILY: ScannerModel = ScannerModel {
     name: "Epson Perfection V800/V850 / GT-X980",
+    support_status: "GT-X980 hardware tested; V800/V850 family",
     vid: 0x04b8,
     pid: 0x0151,
     identity_names: &["GT-X980"],
@@ -433,7 +704,82 @@ pub const V800_FAMILY: ScannerModel = ScannerModel {
     max_ready_wait_secs: 180,
 };
 
-pub static MODELS: &[ScannerModel] = &[V800_FAMILY];
+const V700_SOURCES: &[SourceCapabilities] = &[
+    SourceCapabilities {
+        min_dpi: 50,
+        ..V800_SOURCES[0]
+    },
+    SourceCapabilities {
+        min_dpi: 50,
+        infrared_option: None,
+        ..V800_SOURCES[1]
+    },
+    SourceCapabilities {
+        min_dpi: 50,
+        ..V800_SOURCES[2]
+    },
+];
+
+/// SANE identifies this family as GT-X900. No local identity capture is available.
+pub const V700_FAMILY: ScannerModel = ScannerModel {
+    name: "Epson Perfection V700/V750 / GT-X900 (provisional)",
+    support_status: "provisional; no local hardware verification",
+    pid: 0x012c,
+    identity_names: &["GT-X900"],
+    sources: V700_SOURCES,
+    holders: &[],
+    infrared_mode: None,
+    rgb_mode: ModeCapabilities {
+        experimental: true,
+        ..V800_FAMILY.rgb_mode
+    },
+    gray_mode: Some(ModeCapabilities {
+        wire_mode: 0,
+        channels: 1,
+        depths: &[8, 16],
+        experimental: true,
+    }),
+    transfer: TransferQuirks {
+        allow_start_warmup_recovery: false,
+        ..V800_FAMILY.transfer
+    },
+    ..V800_FAMILY
+};
+
+pub static MODELS: &[ScannerModel] = &[V800_FAMILY, V700_FAMILY];
+
+/// Known USB devices whose interpreter protocol is not implemented by epscan.
+pub const INTERPRETER_SCANNERS: &[(u16, &str)] = &[
+    (0x0130, "Epson Perfection V500 Photo"),
+    (0x013b, "Epson Perfection V550 Photo"),
+    (0x013a, "Epson Perfection V600 Photo"),
+];
+
+pub fn interpreter_scanner(vid: u16, pid: u16) -> Option<&'static str> {
+    (vid == 0x04b8).then_some(())?;
+    INTERPRETER_SCANNERS
+        .iter()
+        .find(|(id, _)| *id == pid)
+        .map(|(_, name)| *name)
+}
+
+pub fn discovery_name(vid: u16, pid: u16) -> Option<&'static str> {
+    scanner_model(vid, pid)
+        .map(|model| model.name)
+        .or_else(|| interpreter_scanner(vid, pid))
+}
+
+pub fn require_native_protocol(vid: u16, pid: u16) -> Result<()> {
+    if let Some(name) = interpreter_scanner(vid, pid) {
+        return Err(unsupported(
+            "scanner protocol",
+            format!(
+                "{name} ({vid:04x}:{pid:04x}) requires the epkowa interpreter; its protocol is not implemented in epscan. USB recognition is not scanning support."
+            ),
+        ));
+    }
+    Ok(())
+}
 
 /// USB discovery uses only registered IDs; identity is checked after connecting.
 pub fn scanner_model(vid: u16, pid: u16) -> Option<&'static ScannerModel> {
@@ -590,11 +936,15 @@ mod tests {
     }
 
     const EXAMPLE_LAYOUT: HolderLayout = HolderLayout {
+        default_film_type: None,
         holder: Holder::V800Film35mm,
         name: "geometry test fixture",
         source: Source::Transparency,
         frames_mm: &[[10.0, 20.0, 24.0, 36.0], [45.0, 58.0, 24.0, 36.0]],
         strip_groups: &[],
+        default_format: None,
+        formats: &[],
+        strip_rects_mm: &[],
     };
 
     #[test]
@@ -736,6 +1086,99 @@ mod tests {
         }
         assert!(strips.windows(2).all(|pair| pair[0][0][0] < pair[1][0][0]));
         assert!(layout.frame_rect(19, 0.0).is_err());
+    }
+
+    #[test]
+    fn half_frame_layout_preserves_holder_and_doubles_strip_capacity() {
+        let holder = V800_FAMILY.holder(Holder::V800Film35mm).unwrap();
+        assert_eq!(holder.for_format(None).unwrap().frames_mm, V800_35MM_FRAMES);
+        let half = holder.for_format(Some(FrameFormat::Film35mmHalf)).unwrap();
+        assert_eq!(half.frames_mm.len(), 36);
+        assert_eq!(half.strip_rects_mm, holder.strip_rects_mm);
+        for frame in 1..=36 {
+            let rect = half.frame_rect(frame, 0.0).unwrap();
+            assert_eq!(rect[2..], [24.0, 18.0]);
+            assert_eq!(
+                half.strip_for_frame(frame).unwrap(),
+                Some((frame - 1) / 12 + 1)
+            );
+            if (frame - 1) % 12 != 0 {
+                assert_eq!(rect[1] - half.frame_rect(frame - 1, 0.0).unwrap()[1], 19.0);
+            }
+        }
+        assert_eq!(
+            half.frame_rect(36, 0.0).unwrap(),
+            [121.5, 225.5, 24.0, 18.0]
+        );
+        assert!(half.frame_rect(37, 0.0).is_err());
+        assert!(holder.for_format(Some(FrameFormat::Film6x6)).is_err());
+    }
+
+    #[test]
+    fn medium_formats_fit_measured_opening_and_keep_whole_strip_geometry() {
+        let holder = V800_FAMILY.holder(Holder::V800MediumFormat).unwrap();
+        assert_eq!(holder.default_format, Some(FrameFormat::Film6x6));
+        assert_eq!(holder.for_format(None).unwrap().frames_mm.len(), 3);
+        assert_eq!(holder.strip_rects_mm, &[[45.1, 33.5, 57.6, 200.0]]);
+        let [x, y, width, height] = holder.strip_rects_mm[0];
+        for (preset, count) in holder.formats.iter().zip([4, 3, 2, 2, 2, 1, 1]) {
+            let layout = holder.for_format(Some(preset.format)).unwrap();
+            assert_eq!(layout.frames_mm.len(), count);
+            assert_eq!(layout.strip_rects_mm, holder.strip_rects_mm);
+            assert!(preset.name.is_ascii());
+            let first = layout.frames_mm.first().unwrap();
+            let last = layout.frames_mm.last().unwrap();
+            assert!((first[1] - y - (y + height - last[1] - last[3])).abs() < 1e-10);
+            for (index, rect) in layout.frames_mm.iter().enumerate() {
+                assert!(rect[0] >= x && rect[0] + rect[2] <= x + width);
+                assert!(rect[1] >= y && rect[1] + rect[3] <= y + height);
+                assert_eq!(rect[2], 56.0);
+                assert_eq!(layout.strip_for_frame(index as u32 + 1).unwrap(), Some(1));
+                if index > 0 {
+                    let previous = layout.frames_mm[index - 1];
+                    assert!((rect[1] - previous[1] - previous[3] - 2.0).abs() < 1e-10);
+                }
+            }
+            assert!(layout.frame_rect(count as u32 + 1, 0.0).is_err());
+        }
+        assert!(holder.for_format(Some(FrameFormat::Film35mm)).is_err());
+        assert!(
+            V800_FAMILY
+                .holder(Holder::V800Film4x5)
+                .unwrap()
+                .for_format(Some(FrameFormat::Film6x6))
+                .is_err()
+        );
+        let serialized = serde_json::to_value(holder).unwrap();
+        assert_eq!(serialized["holder"], "v800-medium-format");
+        assert_eq!(serialized["default_format"], "6x6");
+        assert_eq!(serialized["formats"][0]["format"], "6x4.5");
+        assert_eq!(serialized["formats"][0]["frames_mm"][0][3], 41.5);
+        assert_eq!(
+            serialized["strip_rects_mm"],
+            serde_json::json!([[45.1, 33.5, 57.6, 200.0]])
+        );
+    }
+
+    #[test]
+    fn sheet_holder_is_one_independent_frame_and_serializes_for_adapters() {
+        let holder = V800_FAMILY.holder(Holder::V800Film4x5).unwrap();
+        assert_eq!(holder.source, Source::Transparency);
+        assert_eq!(holder.frames_mm, &[[27.0, 48.0, 94.0, 119.0]]);
+        assert_eq!(holder.strip_for_frame(1).unwrap(), None);
+        assert!(holder.frame_rect(0, 0.0).is_err());
+        assert!(holder.frame_rect(2, 0.0).is_err());
+        assert_eq!(
+            serde_json::from_str::<Holder>("\"v800-4x5\"").unwrap(),
+            Holder::V800Film4x5
+        );
+        let serialized = serde_json::to_value(holder).unwrap();
+        assert_eq!(serialized["holder"], "v800-4x5");
+        assert_eq!(
+            serialized["frames_mm"][0],
+            serde_json::json!([27.0, 48.0, 94.0, 119.0])
+        );
+        assert_eq!(serialized["strip_groups"], serde_json::json!([]));
     }
 
     #[test]

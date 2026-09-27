@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: MIT
 use epscan::{Backend, ScanOptions, ScanSettings, Session};
 use std::{path::Path, sync::atomic::AtomicBool, time::Duration};
 

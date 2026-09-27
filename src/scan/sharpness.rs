@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: MIT
 //! Spatial sharpness measures over unchanged, full-resolution captured samples.
 //!
 //! Samples are normalized by their full-scale integer value; RGB intensity uses

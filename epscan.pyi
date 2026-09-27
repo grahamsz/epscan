@@ -7,10 +7,24 @@ class Settings(TypedDict, total=False):
     source: str
     mode: str
     dpi: int
+    y_oversampling: int
     depth: int
     rect_mm: list[float]
     gamma: str
     preview: bool
+
+class BandingOptions(TypedDict, total=False):
+    strength: float
+    dark_full: float
+    dark_off: float
+    max_frequencies: int
+    min_period: float
+    max_period: float | None
+    window_cycles: float
+    grid_y: int
+    detection_roi: list[int] | None
+    save_raw: bool
+    save_signal: bool
 
 class Options(TypedDict, total=False):
     infrared: bool
@@ -19,6 +33,7 @@ class Options(TypedDict, total=False):
     ir_gamma: str
     thumbnail: bool
     export_tiff: bool
+    banding: BandingOptions | None
     film: str
     pass_timeout: float
     settle_seconds: float

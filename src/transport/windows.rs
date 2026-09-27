@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: MIT
 //! Bulk access through the installed usbscan.sys driver, without WIA/STI/TWAIN.
 use super::{Backend, Device, Transport};
 use crate::{Error, Result, capabilities::scanner_model};
@@ -101,12 +101,12 @@ pub fn discover() -> Result<Vec<Device>> {
                 .ok_or_else(|| Error::Driver("Unterminated device path".into()))?;
             let path = String::from_utf16_lossy(&chars[..len]);
             if let Some((vid, pid)) = usb_ids_from_path(&path) {
-                let Some(model) = scanner_model(vid, pid) else {
+                let Some(name) = crate::capabilities::discovery_name(vid, pid) else {
                     continue;
                 };
                 devices.push(Device {
                     location: path,
-                    name: model.name.into(),
+                    name: name.into(),
                     vid,
                     pid,
                     backend: Backend::Usbscan,

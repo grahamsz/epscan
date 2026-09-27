@@ -22,7 +22,7 @@ pub mod scan;
 pub mod session;
 pub mod transport;
 
-pub use capabilities::{Holder, HolderLayout, ScanMode};
+pub use capabilities::{FrameFormat, Holder, HolderFormatLayout, HolderLayout, ScanMode};
 pub use device::{Backend, Device, list_devices};
 pub use error::{Error, Result};
 pub use protocol::{Capabilities, Gamma, ScanSettings, Source};

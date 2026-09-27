@@ -1,8 +1,9 @@
-// SPDX-License-Identifier: MIT OR Apache-2.0
+// SPDX-License-Identifier: MIT
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use epscan::scan::{HolderSelection, banding::BandingOptions};
 use epscan::{
-    Backend, Capabilities, Error, Gamma, Holder, Result, ScanMode, Source, error::unsupported,
+    Backend, Capabilities, Error, FrameFormat, Gamma, Holder, Result, ScanMode, Source,
+    error::unsupported,
 };
 use std::{collections::HashSet, path::PathBuf, str::FromStr};
 
@@ -33,7 +34,7 @@ pub enum Action {
     /// Acquire rectangles or selected holder frames, with optional infrared passes
     #[command(
         alias = "capture",
-        after_help = "Examples:\n  epscan scan --source film-holder --rect \"10,30,10,10\" --dpi 300\n  epscan scan --source film-holder --rect \"10,30,10,10;40,60,10,10\"\n  epscan scan --holder v800-35mm --frame \"1-5,8-12\" --overage 5"
+        after_help = "Examples:\n  epscan scan --source film-holder --rect \"10,30,10,10\" --dpi 300\n  epscan scan --source film-holder --rect \"10,30,10,10;40,60,10,10\"\n  epscan scan --holder v800-35mm --frame \"1-5,8-12\" --overage 5\n  epscan scan --holder v800-4x5 --frame 1 --dpi 1200"
     )]
     Scan(Scan),
     /// Read identity, advertised capabilities and status without moving the scanner
@@ -41,7 +42,7 @@ pub enum Action {
     Dump(Dump),
     /// Acquire low-resolution, 8-bit previews of rectangles or selected frames
     #[command(
-        after_help = "Examples:\n  epscan preview --source film-holder --rect \"0,0,149,246\"\n  epscan preview --source film-holder --rect \"10,30,10,10;40,60,10,10\"\n  epscan preview --holder v800-35mm --frame \"1-5,8-12\""
+        after_help = "Examples:\n  epscan preview --source film-holder --rect \"0,0,149,246\"\n  epscan preview --source film-holder --rect \"10,30,10,10;40,60,10,10\"\n  epscan preview --holder v800-35mm --frame \"1-5,8-12\"\n  epscan preview --holder v800-4x5 --frame 1"
     )]
     Preview(Preview),
 }
@@ -254,11 +255,14 @@ pub struct Capture {
     #[arg(long, default_value = "scan")]
     pub basename: PathBuf,
     /// Quoted x,y,width,height rectangles in mm, separated by semicolons
-    #[arg(long, requires = "source", conflicts_with_all = ["holder", "frame", "overage"], value_name = "RECTANGLES", allow_hyphen_values = true)]
+    #[arg(long, requires = "source", conflicts_with_all = ["holder", "frame", "frame_format", "overage"], value_name = "RECTANGLES", allow_hyphen_values = true)]
     pub rect: Option<RectangleSelection>,
     /// Select an approximate holder layout instead of an explicit rectangle
     #[arg(long, value_enum, requires = "frame", conflicts_with = "rect")]
     pub holder: Option<Holder>,
+    /// Nominal exposure preset (defaults: 35mm or 6x6); camera gates and spacing vary
+    #[arg(long, value_enum, requires = "holder", conflicts_with = "rect")]
+    pub frame_format: Option<FrameFormat>,
     /// One-based frames or inclusive ranges, e.g. "1-5,8-12"; duplicates omitted
     #[arg(
         long,
@@ -277,8 +281,8 @@ pub struct Capture {
     #[arg(long, value_enum, default_value = "rgb")]
     pub mode: ScanMode,
     /// Film metadata only; samples stay un-inverted and unprofiled
-    #[arg(long, value_enum, default_value = "negative")]
-    pub film: Film,
+    #[arg(long, value_enum)]
+    pub film: Option<Film>,
     /// Measure Tenengrad and variance of Laplacian for each frame or area
     #[arg(long)]
     pub measure_sharpness: bool,
@@ -289,7 +293,7 @@ pub struct Capture {
     #[arg(long, conflicts_with = "raw_only")]
     pub reduce_banding: bool,
     /// Fraction of the estimated band correction to apply
-    #[arg(long, default_value_t = 0.8, value_parser = parse_fraction, requires = "reduce_banding")]
+    #[arg(long, default_value_t = 1.0, value_parser = parse_fraction, requires = "reduce_banding")]
     pub banding_strength: f64,
     /// Full correction mask below this original brightness (fraction of full scale)
     #[arg(long, default_value_t = 0.1, value_parser = parse_fraction, requires = "reduce_banding")]
@@ -319,15 +323,37 @@ pub struct Capture {
 }
 
 impl Capture {
+    pub fn film_name(&self) -> &'static str {
+        self.film.map(Film::name).unwrap_or_else(|| {
+            self.holder
+                .and_then(|holder| {
+                    epscan::capabilities::V800_FAMILY
+                        .holder(holder)
+                        .ok()
+                        .and_then(|layout| layout.default_film_type)
+                })
+                .unwrap_or("negative")
+        })
+    }
     /// Validate option relationships and numbers before opening the device.
     pub fn validate_area(&self) -> Result<()> {
         self.banding_options()?;
-        if self.holder.is_some() {
+        if let Some(holder) = self.holder {
             if self.rect.is_some() || self.frame.is_none() {
                 return Err(Error::Invalid(
                     "--holder requires a positive --frame and conflicts with --rect".into(),
                 ));
             }
+            // All current holder IDs belong to this family. Reject incompatible
+            // presets and capacities before opening USB; resolve again against
+            // the connected model before any acquisition.
+            let layout = epscan::capabilities::V800_FAMILY
+                .holder(holder)?
+                .for_format(self.frame_format)?;
+            self.frame
+                .as_ref()
+                .expect("validated frames")
+                .resolve(layout.frames_mm.len())?;
             if self
                 .overage
                 .is_some_and(|value| !value.is_finite() || value <= -100.0)
@@ -337,9 +363,9 @@ impl Capture {
                 ));
             }
         } else {
-            if self.frame.is_some() || self.overage.is_some() {
+            if self.frame.is_some() || self.frame_format.is_some() || self.overage.is_some() {
                 return Err(Error::Invalid(
-                    "--frame and --overage require --holder".into(),
+                    "--frame, --frame-format and --overage require --holder".into(),
                 ));
             }
             if self.source.is_none() {
@@ -389,7 +415,7 @@ impl Capture {
         self.validate_area()?;
         if let Some(holder) = self.holder {
             let model = caps.scanner_model()?;
-            let layout = model.holder(holder)?;
+            let layout = model.holder(holder)?.for_format(self.frame_format)?;
             let source = layout.source;
             if self.source.is_some_and(|explicit| explicit != source) {
                 return Err(Error::Invalid(format!(
@@ -405,13 +431,14 @@ impl Capture {
             frames
                 .into_iter()
                 .map(|frame| {
-                    let rect_mm = model.holder_frame(holder, frame, overage_percent)?;
+                    let rect_mm = layout.frame_rect(frame, overage_percent)?;
                     validate_source_rectangle(caps, source, rect_mm)?;
                     Ok(ResolvedArea {
                         source,
                         rect_mm,
                         holder_selection: Some(HolderSelection {
                             holder,
+                            frame_format: self.frame_format,
                             frame,
                             overage_percent,
                         }),
@@ -478,6 +505,9 @@ pub struct Scan {
     /// Requested output resolution (not measured optical resolution)
     #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u32).range(1..))]
     pub dpi: u32,
+    /// Average N carriage-axis samples into each output row (limited to hardware Y DPI)
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=16))]
+    pub y_oversampling: u32,
     /// Bits per channel for RGB or grayscale
     #[arg(long, default_value_t = 16, value_parser = parse_depth, conflicts_with = "ir_only")]
     pub depth: u8,
@@ -521,7 +551,7 @@ impl Scan {
                 "--measure-sharpness requires an RGB or grayscale pass and conflicts with --ir-only".into(),
             ));
         }
-        if (self.ir || self.ir_only) && matches!(self.capture.film, Film::Mono) {
+        if (self.ir || self.ir_only) && matches!(self.capture.film, Some(Film::Mono)) {
             return Err(unsupported(
                 "IR for mono film",
                 "silver-bearing film is unsuitable",
@@ -588,6 +618,25 @@ mod tests {
     }
 
     #[test]
+    fn carriage_sampling_has_explicit_factor_and_bounded_integer_parser() {
+        let Action::Scan(defaults) = parse_capture("scan", &[]).unwrap().action else {
+            panic!("expected scan")
+        };
+        assert_eq!(defaults.y_oversampling, 1);
+        let Action::Scan(sampled) =
+            parse_capture("scan", &["--dpi", "3200", "--y-oversampling", "3"])
+                .unwrap()
+                .action
+        else {
+            panic!("expected scan")
+        };
+        assert_eq!((sampled.dpi, sampled.y_oversampling), (3200, 3));
+        for invalid in ["0", "17", "1.5", "-1"] {
+            assert!(parse_capture("scan", &["--y-oversampling", invalid]).is_err());
+        }
+    }
+
+    #[test]
     fn gamma_defaults_to_device_default_and_identity_remains_explicit() {
         for command in ["scan", "capture", "preview"] {
             for (arguments, expected) in [
@@ -633,7 +682,7 @@ mod tests {
             );
             capture.validate_area().unwrap();
             let config = capture.banding_options().unwrap().unwrap();
-            assert_eq!(config.strength, 0.8);
+            assert_eq!(config.strength, 1.0);
             assert_eq!(config.dark_full, 0.1);
             assert_eq!(config.dark_off, 0.6);
             assert!(config.save_raw && config.save_signal);
@@ -726,7 +775,7 @@ mod tests {
                     parse_capture(command, &["--mode", spelling, "--measure-sharpness"]).unwrap(),
                 );
                 assert_eq!(capture.mode, ScanMode::Gray);
-                assert_eq!(capture.film.name(), "negative");
+                assert_eq!(capture.film_name(), "negative");
                 assert!(capture.measure_sharpness);
             }
             let film = capture_from(parse_capture(command, &["--film", "mono"]).unwrap());
@@ -738,6 +787,28 @@ mod tests {
         }
         assert!(parse_capture("scan", &["--ir-only"]).is_ok());
         assert!(parse_capture("scan", &["--mode", "gray", "--ir"]).is_ok());
+    }
+
+    #[test]
+    fn mounted_slide_film_default_allows_explicit_override() {
+        for command in ["scan", "preview"] {
+            for (extra, expected) in [(None, "positive"), (Some("negative"), "negative")] {
+                let mut args = vec![
+                    "epscan",
+                    command,
+                    "--holder",
+                    "v800-slides",
+                    "--frame",
+                    "1-12",
+                ];
+                if let Some(film) = extra {
+                    args.extend(["--film", film]);
+                }
+                let capture = capture_from(Cli::try_parse_from(args).unwrap());
+                assert_eq!(capture.film_name(), expected);
+                assert_eq!(capture.resolve_areas(&capabilities()).unwrap().len(), 12);
+            }
+        }
     }
 
     fn capabilities() -> Capabilities {
@@ -756,35 +827,38 @@ mod tests {
     fn holder_scan_and_preview_imply_source_and_preserve_selection() {
         let caps = capabilities();
         let model = caps.scanner_model().unwrap();
-        for command in ["scan", "capture", "preview"] {
-            for (extra, expected_overage) in [
-                (vec![], 0.0),
-                (vec!["--overage", "5"], 5.0),
-                (vec!["--overage", "-10"], -10.0),
-            ] {
-                let capture = capture_from(
-                    Cli::try_parse_from(
-                        ["epscan", command, "--holder", "v800-35mm", "--frame", "1"]
-                            .into_iter()
-                            .chain(extra),
-                    )
-                    .unwrap(),
-                );
-                assert!(capture.source.is_none());
-                assert!(capture.validate_area().is_ok());
-                let areas = capture.resolve_areas(&caps).unwrap();
-                assert_eq!(areas.len(), 1);
-                assert_eq!(areas[0].source, Source::Transparency);
-                assert_eq!(
-                    areas[0].rect_mm,
-                    model
-                        .holder_frame(Holder::V800Film35mm, 1, expected_overage)
-                        .unwrap()
-                );
-                let selection = areas[0].holder_selection.unwrap();
-                assert_eq!(selection.holder, Holder::V800Film35mm);
-                assert_eq!(selection.frame, 1);
-                assert_eq!(selection.overage_percent, expected_overage);
+        for (holder_arg, holder) in [
+            ("v800-35mm", Holder::V800Film35mm),
+            ("v800-4x5", Holder::V800Film4x5),
+        ] {
+            for command in ["scan", "capture", "preview"] {
+                for (extra, expected_overage) in [
+                    (vec![], 0.0),
+                    (vec!["--overage", "5"], 5.0),
+                    (vec!["--overage", "-10"], -10.0),
+                ] {
+                    let capture = capture_from(
+                        Cli::try_parse_from(
+                            ["epscan", command, "--holder", holder_arg, "--frame", "1"]
+                                .into_iter()
+                                .chain(extra),
+                        )
+                        .unwrap(),
+                    );
+                    assert!(capture.source.is_none());
+                    assert!(capture.validate_area().is_ok());
+                    let areas = capture.resolve_areas(&caps).unwrap();
+                    assert_eq!(areas.len(), 1);
+                    assert_eq!(areas[0].source, Source::Transparency);
+                    assert_eq!(
+                        areas[0].rect_mm,
+                        model.holder_frame(holder, 1, expected_overage).unwrap()
+                    );
+                    let selection = areas[0].holder_selection.unwrap();
+                    assert_eq!(selection.holder, holder);
+                    assert_eq!(selection.frame, 1);
+                    assert_eq!(selection.overage_percent, expected_overage);
+                }
             }
         }
     }
@@ -827,42 +901,145 @@ mod tests {
     #[test]
     fn holder_resolves_only_compatible_sources_and_existing_frames() {
         let caps = capabilities();
+        for (holder_arg, holder) in [
+            ("v800-35mm", Holder::V800Film35mm),
+            ("v800-4x5", Holder::V800Film4x5),
+        ] {
+            for command in ["scan", "preview"] {
+                for (source, compatible) in [
+                    ("film-holder", true),
+                    ("transparency", true),
+                    ("flatbed", false),
+                    ("film-area-guide", false),
+                ] {
+                    let capture = capture_from(
+                        Cli::try_parse_from([
+                            "epscan", command, "--holder", holder_arg, "--frame", "1", "--source",
+                            source,
+                        ])
+                        .unwrap(),
+                    );
+                    assert_eq!(
+                        capture.resolve_areas(&caps).is_ok(),
+                        compatible,
+                        "{holder_arg} {source}"
+                    );
+                }
+                let mut capture = capture_from(
+                    Cli::try_parse_from([
+                        "epscan", command, "--holder", holder_arg, "--frame", "1",
+                    ])
+                    .unwrap(),
+                );
+                let missing_frame = caps
+                    .scanner_model()
+                    .unwrap()
+                    .holder(holder)
+                    .unwrap()
+                    .frames_mm
+                    .len()
+                    + 1;
+                capture.frame = Some(missing_frame.to_string().parse().unwrap());
+                assert!(capture.resolve_areas(&caps).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn holder_formats_resolve_geometry_and_metadata_for_scan_and_preview() {
+        let caps = capabilities();
         for command in ["scan", "preview"] {
-            for (source, compatible) in [
-                ("film-holder", true),
-                ("transparency", true),
-                ("flatbed", false),
-                ("film-area-guide", false),
+            for (holder, format, frames, dimensions, expected) in [
+                ("v800-35mm", "35mm-half", "1-36", [24.0, 18.0], 36),
+                ("v800-medium-format", "6x4.5", "1-4", [56.0, 41.5], 4),
+                ("v800-medium-format", "6x6", "1-3", [56.0, 56.0], 3),
+                ("v800-medium-format", "6x7", "1-2", [56.0, 69.0], 2),
+                ("v800-medium-format", "6x8", "1-2", [56.0, 76.0], 2),
+                ("v800-medium-format", "6x9", "1-2", [56.0, 84.0], 2),
+                ("v800-medium-format", "6x12", "1", [56.0, 112.0], 1),
+                ("v800-medium-format", "6x17", "1", [56.0, 168.0], 1),
             ] {
                 let capture = capture_from(
                     Cli::try_parse_from([
                         "epscan",
                         command,
                         "--holder",
-                        "v800-35mm",
+                        holder,
+                        "--frame-format",
+                        format,
                         "--frame",
-                        "1",
-                        "--source",
-                        source,
+                        frames,
                     ])
                     .unwrap(),
                 );
-                assert_eq!(capture.resolve_areas(&caps).is_ok(), compatible, "{source}");
+                capture.validate_area().unwrap();
+                let areas = capture.resolve_areas(&caps).unwrap();
+                assert_eq!(areas.len(), expected);
+                for area in areas {
+                    assert_eq!(area.rect_mm[2..], dimensions);
+                    let selection = area.holder_selection.unwrap();
+                    assert_eq!(
+                        serde_json::to_value(selection.frame_format).unwrap(),
+                        format
+                    );
+                    let settings = epscan::ScanSettings {
+                        source: area.source,
+                        rect_mm: area.rect_mm,
+                        ..Default::default()
+                    };
+                    let options = epscan::ScanOptions {
+                        holder_selection: Some(selection),
+                        ..Default::default()
+                    };
+                    options.plan(&settings, &caps).unwrap();
+                }
             }
-            let mut capture = capture_from(
-                Cli::try_parse_from(["epscan", command, "--holder", "v800-35mm", "--frame", "1"])
+        }
+    }
+
+    #[test]
+    fn incompatible_formats_and_capacity_are_rejected_before_connection() {
+        for command in ["scan", "preview"] {
+            for (holder, format, frames) in [
+                ("v800-35mm", "6x6", "1"),
+                ("v800-4x5", "35mm", "1"),
+                ("v800-medium-format", "35mm-half", "1"),
+                ("v800-medium-format", "6x6", "4"),
+                ("v800-medium-format", "6x9", "1-3"),
+                ("v800-medium-format", "6x17", "2"),
+                ("v800-35mm", "35mm-half", "37"),
+            ] {
+                let capture = capture_from(
+                    Cli::try_parse_from([
+                        "epscan",
+                        command,
+                        "--holder",
+                        holder,
+                        "--frame-format",
+                        format,
+                        "--frame",
+                        frames,
+                    ])
                     .unwrap(),
+                );
+                assert!(
+                    capture.validate_area().is_err(),
+                    "{holder} {format} {frames}"
+                );
+            }
+            assert!(
+                Cli::try_parse_from([
+                    "epscan",
+                    command,
+                    "--source",
+                    "film-holder",
+                    "--rect",
+                    "10,10,10,10",
+                    "--frame-format",
+                    "6x6"
+                ])
+                .is_err()
             );
-            let missing_frame = caps
-                .scanner_model()
-                .unwrap()
-                .holder(Holder::V800Film35mm)
-                .unwrap()
-                .frames_mm
-                .len()
-                + 1;
-            capture.frame = Some(missing_frame.to_string().parse().unwrap());
-            assert!(capture.resolve_areas(&caps).is_err());
         }
     }
 
