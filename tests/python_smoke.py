@@ -1,7 +1,14 @@
 """Hardware-free extension import/argument smoke checks."""
+from importlib.metadata import version
+from pathlib import Path
+import tomllib
+
 import epscan
 
-assert epscan.__version__ == "0.1.0"
+with (Path(__file__).resolve().parents[1] / "Cargo.toml").open("rb") as manifest:
+    expected_version = tomllib.load(manifest)["package"]["version"]
+assert epscan.__version__ == expected_version
+assert version("epscan") == expected_version
 assert issubclass(epscan.ScanCancelled, epscan.ScannerError)
 assert issubclass(epscan.DeviceBusy, epscan.ScannerError)
 assert callable(epscan.Session.plan_regions)
