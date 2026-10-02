@@ -117,7 +117,7 @@ the `frames` shape described above.
 
 ![35mm holder numbering in device-order coordinates](35mm-holder.svg)
 
-The layout is numbered top to bottom down each strip, then left to right across
+The layout is numbered top to bottom down each strip, then right to left across
 the **unrotated, unmirrored device-order preview**: 1–6, 7–12, 13–18. Align the
 holder arrows with the scanner arrows as shown in [Epson's placement guide](https://files.support.epson.com/docid/cpd4/cpd41530/source/scanners/source/placing_originals/tasks/placing_filmstrips_pv800_v850.html).
 
@@ -146,24 +146,24 @@ film-holder source origin:
 
 | Frame | x | y | Width | Height |
 | --- | ---: | ---: | ---: | ---: |
-| 1 | 2.3 | 16.5 | 24 | 36 |
-| 2 | 2.3 | 54.5 | 24 | 36 |
-| 3 | 2.3 | 92.5 | 24 | 36 |
-| 4 | 2.3 | 130.5 | 24 | 36 |
-| 5 | 2.3 | 168.5 | 24 | 36 |
-| 6 | 2.3 | 206.5 | 24 | 36 |
+| 1 | 121.5 | 16.5 | 24 | 36 |
+| 2 | 121.5 | 54.5 | 24 | 36 |
+| 3 | 121.5 | 92.5 | 24 | 36 |
+| 4 | 121.5 | 130.5 | 24 | 36 |
+| 5 | 121.5 | 168.5 | 24 | 36 |
+| 6 | 121.5 | 206.5 | 24 | 36 |
 | 7 | 62.1 | 16.5 | 24 | 36 |
 | 8 | 62.1 | 54.5 | 24 | 36 |
 | 9 | 62.1 | 92.5 | 24 | 36 |
 | 10 | 62.1 | 130.5 | 24 | 36 |
 | 11 | 62.1 | 168.5 | 24 | 36 |
 | 12 | 62.1 | 206.5 | 24 | 36 |
-| 13 | 121.5 | 16.5 | 24 | 36 |
-| 14 | 121.5 | 54.5 | 24 | 36 |
-| 15 | 121.5 | 92.5 | 24 | 36 |
-| 16 | 121.5 | 130.5 | 24 | 36 |
-| 17 | 121.5 | 168.5 | 24 | 36 |
-| 18 | 121.5 | 206.5 | 24 | 36 |
+| 13 | 2.3 | 16.5 | 24 | 36 |
+| 14 | 2.3 | 54.5 | 24 | 36 |
+| 15 | 2.3 | 92.5 | 24 | 36 |
+| 16 | 2.3 | 130.5 | 24 | 36 |
+| 17 | 2.3 | 168.5 | 24 | 36 |
+| 18 | 2.3 | 206.5 | 24 | 36 |
 
 The implementation table is in `src/capabilities.rs`. `epscan dump` includes
 registered layouts in `model_profile.holders`. Rust callers can resolve a
@@ -322,7 +322,7 @@ frame/bounding-box behavior rather than acquiring all unused aperture space.
 The existing 35 mm holder also supports `--frame-format 35mm-half`. Its nominal
 24 x 18 mm crops use a 19 mm pitch along each strip. The calibrated x positions
 and first y=16.5 mm are unchanged; each strip contains twelve frames rather than
-six. Numbering is 1-12 on the left, 13-24 in the middle, and 25-36 on the right.
+six. Numbering is 1-12 on the right, 13-24 in the middle, and 25-36 on the left.
 This is an inferred starter grid based on the existing full-frame calibration;
 it has not been verified with loaded half-frame film.
 

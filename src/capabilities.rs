@@ -456,27 +456,27 @@ const V800_SOURCES: &[SourceCapabilities] = &[
 // Horizontal opening positions are rounded to 0.1 mm. The nominal 24 x 36 mm
 // frames start at y=16.5 mm with 38 mm pitch, aligned against the loaded-film
 // previews in captures/negpy-holder-debug-20260925. Individual strip placement
-// still varies. Strips are numbered left to right, frames top to bottom:
-// left 1-6, middle 7-12, right 13-18. No image rotation is assumed.
+// still varies. Strips are numbered right to left, frames top to bottom:
+// right 1-6, middle 7-12, left 13-18. No image rotation is assumed.
 const V800_35MM_FRAMES: &[[f64; 4]] = &[
-    [2.3, 16.5, 24.0, 36.0],
-    [2.3, 54.5, 24.0, 36.0],
-    [2.3, 92.5, 24.0, 36.0],
-    [2.3, 130.5, 24.0, 36.0],
-    [2.3, 168.5, 24.0, 36.0],
-    [2.3, 206.5, 24.0, 36.0],
-    [62.1, 16.5, 24.0, 36.0],
-    [62.1, 54.5, 24.0, 36.0],
-    [62.1, 92.5, 24.0, 36.0],
-    [62.1, 130.5, 24.0, 36.0],
-    [62.1, 168.5, 24.0, 36.0],
-    [62.1, 206.5, 24.0, 36.0],
     [121.5, 16.5, 24.0, 36.0],
     [121.5, 54.5, 24.0, 36.0],
     [121.5, 92.5, 24.0, 36.0],
     [121.5, 130.5, 24.0, 36.0],
     [121.5, 168.5, 24.0, 36.0],
     [121.5, 206.5, 24.0, 36.0],
+    [62.1, 16.5, 24.0, 36.0],
+    [62.1, 54.5, 24.0, 36.0],
+    [62.1, 92.5, 24.0, 36.0],
+    [62.1, 130.5, 24.0, 36.0],
+    [62.1, 168.5, 24.0, 36.0],
+    [62.1, 206.5, 24.0, 36.0],
+    [2.3, 16.5, 24.0, 36.0],
+    [2.3, 54.5, 24.0, 36.0],
+    [2.3, 92.5, 24.0, 36.0],
+    [2.3, 130.5, 24.0, 36.0],
+    [2.3, 168.5, 24.0, 36.0],
+    [2.3, 206.5, 24.0, 36.0],
 ];
 
 // Visible opening measured with a loaded negative on 2026-09-26, from the
@@ -498,7 +498,7 @@ const fn half_frames() -> [[f64; 4]; 36] {
     let mut index = 0;
     while index < frames.len() {
         frames[index] = [
-            [2.3, 62.1, 121.5][index / 12],
+            [121.5, 62.1, 2.3][index / 12],
             16.5 + (index % 12) as f64 * 19.0,
             24.0,
             18.0,
@@ -631,9 +631,9 @@ const V800_HOLDERS: &[HolderLayout] = &[
         default_format: Some(FrameFormat::Film35mm),
         formats: V800_35MM_FORMATS,
         strip_rects_mm: &[
-            [2.3, 16.5, 24.0, 227.0],
-            [62.1, 16.5, 24.0, 227.0],
             [121.5, 16.5, 24.0, 227.0],
+            [62.1, 16.5, 24.0, 227.0],
+            [2.3, 16.5, 24.0, 227.0],
         ],
     },
     HolderLayout {
@@ -1048,7 +1048,7 @@ mod tests {
         let layout = V800_FAMILY.holder(Holder::V800Film35mm).unwrap();
         let nominal = layout.frame_rect(1, 0.0).unwrap();
         let cropped = layout.frame_rect(1, -10.0).unwrap();
-        for (actual, expected) in cropped.into_iter().zip([3.5, 18.3, 21.6, 32.4]) {
+        for (actual, expected) in cropped.into_iter().zip([122.7, 18.3, 21.6, 32.4]) {
             assert!((actual - expected).abs() < 1e-10);
         }
         for axis in 0..2 {
@@ -1068,12 +1068,18 @@ mod tests {
         let layout = V800_FAMILY.holder(Holder::V800Film35mm).unwrap();
         assert_eq!(layout.source, Source::Transparency);
         assert_eq!(layout.frames_mm.len(), 18);
-        assert_eq!(layout.frame_rect(1, 0.0).unwrap(), [2.3, 16.5, 24.0, 36.0]);
-        assert_eq!(layout.frame_rect(6, 0.0).unwrap(), [2.3, 206.5, 24.0, 36.0]);
+        assert_eq!(
+            layout.frame_rect(1, 0.0).unwrap(),
+            [121.5, 16.5, 24.0, 36.0]
+        );
+        assert_eq!(
+            layout.frame_rect(6, 0.0).unwrap(),
+            [121.5, 206.5, 24.0, 36.0]
+        );
         assert_eq!(layout.frame_rect(7, 0.0).unwrap(), [62.1, 16.5, 24.0, 36.0]);
         assert_eq!(
             layout.frame_rect(18, 0.0).unwrap(),
-            [121.5, 206.5, 24.0, 36.0]
+            [2.3, 206.5, 24.0, 36.0]
         );
         let (strips, remainder) = layout.frames_mm.as_chunks::<6>();
         assert!(remainder.is_empty());
@@ -1084,7 +1090,7 @@ mod tests {
                 assert_eq!(pair[1][1] - pair[0][1], 38.0);
             }
         }
-        assert!(strips.windows(2).all(|pair| pair[0][0][0] < pair[1][0][0]));
+        assert!(strips.windows(2).all(|pair| pair[0][0][0] > pair[1][0][0]));
         assert!(layout.frame_rect(19, 0.0).is_err());
     }
 
@@ -1106,10 +1112,7 @@ mod tests {
                 assert_eq!(rect[1] - half.frame_rect(frame - 1, 0.0).unwrap()[1], 19.0);
             }
         }
-        assert_eq!(
-            half.frame_rect(36, 0.0).unwrap(),
-            [121.5, 225.5, 24.0, 18.0]
-        );
+        assert_eq!(half.frame_rect(36, 0.0).unwrap(), [2.3, 225.5, 24.0, 18.0]);
         assert!(half.frame_rect(37, 0.0).is_err());
         assert!(holder.for_format(Some(FrameFormat::Film6x6)).is_err());
     }

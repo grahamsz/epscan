@@ -318,7 +318,7 @@ pub struct Capture {
     #[arg(long)]
     pub json: bool,
     /// Image-transfer deadline in seconds per pass, checked at block boundaries
-    #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u64).range(1..))]
     pub scan_timeout: u64,
 }
 
@@ -615,6 +615,17 @@ mod tests {
             .into_iter()
             .chain(arguments.iter().copied()),
         )
+    }
+
+    #[test]
+    fn scan_deadline_defaults_to_one_hour_with_separate_block_timeout() {
+        for command in ["scan", "preview"] {
+            let cli = parse_capture(command, &[]).unwrap();
+            assert_eq!(cli.io_timeout, 60);
+            assert_eq!(capture_from(cli).scan_timeout, 3600);
+            let custom = parse_capture(command, &["--scan-timeout", "1200"]).unwrap();
+            assert_eq!(capture_from(custom).scan_timeout, 1200);
+        }
     }
 
     #[test]
@@ -1245,7 +1256,7 @@ mod tests {
                 .unwrap(),
             );
             let area = capture.resolve_areas(&caps).unwrap().remove(0);
-            for (actual, expected) in area.rect_mm.into_iter().zip([3.5, 18.3, 21.6, 32.4]) {
+            for (actual, expected) in area.rect_mm.into_iter().zip([122.7, 18.3, 21.6, 32.4]) {
                 assert!((actual - expected).abs() < 1e-9);
             }
             assert_eq!(area.holder_selection.unwrap().overage_percent, -10.0);
@@ -1407,7 +1418,7 @@ mod tests {
     #[test]
     fn invalid_later_frame_geometry_rejects_the_complete_selection() {
         let caps = capabilities();
-        // Frame 7 can grow 25% within the source, but frame 1 then crosses its
+        // Frame 7 can grow 25% within the source, but frame 13 then crosses its
         // left edge. Resolving must not return the valid first frame alone.
         let capture = capture_from(
             Cli::try_parse_from([
@@ -1416,7 +1427,7 @@ mod tests {
                 "--holder",
                 "v800-35mm",
                 "--frame",
-                "7,1",
+                "7,13",
                 "--overage",
                 "25",
             ])

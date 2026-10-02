@@ -111,7 +111,7 @@ impl Default for ScanOptions {
             holder_selection: None,
             measure_sharpness: false,
             banding: None,
-            pass_timeout: Duration::from_secs(600),
+            pass_timeout: Duration::from_secs(3600),
             settle_time: Duration::from_secs(10),
         }
     }
@@ -719,7 +719,7 @@ mod tests {
         );
         assert_eq!(
             metadata["nominal_rect_mm"],
-            serde_json::json!([2.3, 16.5, 24.0, 36.0])
+            serde_json::json!([121.5, 16.5, 24.0, 36.0])
         );
         assert!(
             metadata["overage_semantics"]

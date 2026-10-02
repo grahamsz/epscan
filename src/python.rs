@@ -404,6 +404,12 @@ mod tests {
             settings.set_item("samples", 2).unwrap();
             assert!(from_dict::<ScanSettings>(Some(&settings)).is_err());
             let options = PyDict::new(py);
+            let defaults = from_dict::<Options>(Some(&options)).unwrap();
+            assert_eq!(defaults.pass_timeout, 3600.0);
+            assert_eq!(
+                defaults.into_scan_options().unwrap().pass_timeout.as_secs(),
+                3600
+            );
             options.set_item("exposure", 2).unwrap();
             assert!(from_dict::<Options>(Some(&options)).is_err());
             assert!(duration(f64::NAN, "timeout", false).is_err());

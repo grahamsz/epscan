@@ -1144,7 +1144,7 @@ mod tests {
             ..Default::default()
         };
         let source_settings = ScanSettings {
-            rect_mm: [0.0, 0.0, 40.0, 60.0],
+            rect_mm: [0.0, 0.0, 149.0, 60.0],
             ..target_settings.clone()
         };
         let (source, plan) =

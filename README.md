@@ -198,7 +198,8 @@ future implementation lead in [the research notes](docs/sources.md).
 
 The CLI rejects conflicting or unused options (for example visible-image mode or depth with
 `--ir-only`). Library calls preflight every planned pass before capture. Use
-`--io-timeout` for response/block reads, `--scan-timeout` for image acquisition,
+`--io-timeout` for response/block reads (default 60 seconds),
+`--scan-timeout` for image acquisition (default one hour per pass),
 and `--settle-seconds` for the delay between passes. That delay is not a readiness
 guarantee. Ctrl+C requests cancellation at the next safe transfer boundary.
 

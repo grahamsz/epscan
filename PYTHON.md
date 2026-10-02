@@ -59,7 +59,7 @@ Optional `options` entries:
 | `export_tiff` | true; false keeps raw payload and metadata only |
 | `banding` | `None`; `{}` enables the default backlight band reduction preset for visible TIFFs |
 | `film` | `negative`; media label, no inversion/profile processing |
-| `pass_timeout` | 600 seconds; image transfer deadline |
+| `pass_timeout` | 3600 seconds (one hour) per pass; individual response/block reads still use the session timeout (60 seconds by default) |
 | `settle_seconds` | 10 seconds; delay between passes |
 
 Unknown keys and invalid values are rejected. Source eligibility, geometry,
